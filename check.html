@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="light dark">
+<title>Compatibility Check</title>
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/app.css">
+<style>
+  .checks { list-style: none; padding: 0; margin: 0 0 20px; display: flex; flex-direction: column; gap: 2px; }
+  .checks li { display: flex; gap: 12px; align-items: flex-start; padding: 10px 4px; border-bottom: 1px solid var(--border); }
+  .checks .st { width: 24px; height: 24px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; flex: none; font-size: 13px; background: var(--surface-2); color: var(--muted); }
+  .checks .ok .st { background: var(--ok-soft); color: var(--ok-ink); }
+  .checks .bad .st { background: var(--danger-soft); color: var(--danger-ink); }
+  .checks .warn .st { background: var(--warn-soft); color: var(--warn-ink); }
+  .checks .t { font-weight: 600; }
+  .checks .d { font-size: 13px; color: var(--muted); }
+  .summary { font-weight: 600; margin: 0 0 16px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="screen-center">
+    <div class="card">
+      <div class="brand">
+        <div class="brand-logo"><span class="icon"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span></div>
+        <div><h1>Compatibility check</h1><p>Tests whether this PC and browser can run Sankyo Chat.</p></div>
+      </div>
+      <p class="summary" id="summary" role="status">Running checks…</p>
+      <ul class="checks" id="checks"></ul>
+      <button class="btn btn-primary btn-lg" id="folder-test" type="button">Test the shared folder</button>
+      <p class="muted" style="font-size:13px;margin:10px 0 0">Pick the <b>data</b> folder. The test writes a small file, reads it back and deletes it.</p>
+      <div class="card-foot">
+        <button class="link-btn" id="notify-test" type="button">Test a desktop notification</button>
+        <a href="index.html">Back to Sankyo Chat</a>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="js/version.js"></script>
+<script src="js/check.js"></script>
+</body>
+</html>

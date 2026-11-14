@@ -1,0 +1,11 @@
+# Live workspace data: messages, profiles, password-protected keys, attachments.
+# Never commit it. Only the readme that explains the folder is tracked.
+data/*
+!data/README.txt
+
+# Editor / OS clutter
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.crswap
