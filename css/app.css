@@ -481,3 +481,13 @@ kbd { font: 12px var(--font); border: 1px solid currentColor; border-radius: 5px
 .msg:hover { background: transparent; }
 .msg:hover .msg-text:not(.gone):not(.big-emoji) { filter: brightness(.97); }
 @media (max-width: 600px) { .msg-main > * { max-width: 88%; } }
+.seen { display: flex; justify-content: flex-end; align-items: center; gap: 4px; padding: 0 72px 6px 20px; font-size: 12px; color: var(--muted); }
+.seen .icon { width: 13px; height: 13px; }
+.ann-list { display: flex; flex-direction: column; gap: 10px; max-height: 60vh; overflow-y: auto; }
+.ann-item { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: var(--surface); }
+.ann-item.new { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.ann-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
+.ann-title { font-weight: 700; }
+.msg-text.ann-text:not(.gone):not(.big-emoji) { display: block; background: none; padding: 0; border-radius: 0; line-height: 1.5; }
+.ann-reach { margin-top: 8px; font-size: 13px; }
+.ann-reach summary { cursor: pointer; color: var(--text-2); font-weight: 600; }

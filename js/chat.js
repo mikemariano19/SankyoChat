@@ -68,10 +68,11 @@
         UI.toast(`You were removed from ${Y.info(ch).name}.`);
         if (ch.id === st.openId) { UI.closeAll(); Chat.open(Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]); }
       }),
-      Y.events.on('presence', () => schedule('side', 'head')),
+      Y.events.on('presence', () => { schedule('side', 'head'); if (seenSig(cur()) !== st.seenSig) schedule('msgs'); }),
       Y.events.on('connection', () => schedule('side', 'banners')),
       Y.events.on('incoming', onIncoming),
       Y.events.on('inbox', () => schedule('side')),
+      Y.events.on('announcements', () => { schedule('side'); showPendingAnnouncement(); }),
       A.events.on('workspace', () => { schedule('side', 'head', 'composer', 'msgs'); if (A.isRemoved(meId())) SC.app.lock('Your account was removed by the admin.'); }),
       A.events.on('users', () => schedule('side', 'head', 'msgs')),
       A.events.on('wsTampered', () => { st.banners.wsTampered = true; schedule('banners'); }),
@@ -79,6 +80,7 @@
     const last = U.ls.get('lastOpen.' + A.ws.id);
     Chat.open(Y.chans.has(last) ? last : (Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]));
     if (A.isOwner()) A.loadInbox().then(ch => { if (ch) schedule('side'); }).catch(() => {});
+    showPendingAnnouncement();
     renderBanners();
   };
 
@@ -167,6 +169,11 @@
         h('div', { class: 'side-sec' }, h('span', null, 'Direct messages'), h('button', { class: 'icon-btn', 'data-act': 'new-dm', 'data-key': 'newdm', 'aria-label': 'New direct message', title: 'New direct message' }, icon('plus'))),
         dms.length ? dms.map(item) : h('div', { class: 'side-empty' }, 'No conversations yet')),
       h('div', { class: 'side-tools' },
+        (() => {
+          const n = Y.pendingAnnouncements().length;
+          return h('button', { class: 'side-item' + (n ? ' unread' : ''), 'data-act': 'announcements', 'data-key': 'ann' }, icon('megaphone'), h('span', { class: 'lbl' }, 'Announcements'),
+            n ? h('span', { class: 'badge red' }, String(n)) : null);
+        })(),
         A.isOwner() ? null : h('button', { class: 'side-item', 'data-act': 'feedback', 'data-key': 'fb' }, icon('megaphone'), h('span', { class: 'lbl' }, 'Send feedback')),
         A.isOwner() ? h('button', { class: 'side-item' + (inboxCount ? ' unread' : ''), 'data-act': 'inbox', 'data-key': 'inbox' }, icon('inbox'), h('span', { class: 'lbl' }, 'Feedback inbox'), inboxCount ? h('span', { class: 'badge red' }, String(inboxCount)) : null) : null),
       h('div', { class: 'side-me' },
@@ -190,6 +197,7 @@
       case 'new-group': return newGroupDialog();
       case 'feedback': return feedbackDialog();
       case 'inbox': return A.isOwner() ? inboxDialog() : null;
+      case 'announcements': return announcementsDialog();
       case 'me-menu': return profileMenu(t);
     }
   }
@@ -376,6 +384,27 @@
     return row;
   }
 
+  /** Who has read up to my newest message; re-render only when this changes. */
+  function seenSig(ch) {
+    if (!ch || ch.kind === 'public') return '';
+    let last = 0;
+    for (const m of ch.msgs.values()) if (m.userId === meId() && !m.deleted && m.ts > last) last = m.ts;
+    return last ? last + ':' + Y.seenBy(ch, last).sort().join(',') : '';
+  }
+  function seenLine(ch, m) {
+    const ids = Y.seenBy(ch, m.ts);
+    if (!ids.length) return null;
+    const others = Y.members(ch).filter(id => id !== meId());
+    let text;
+    if (ch.kind === 'dm') text = 'Seen';
+    else if (ids.length === others.length) text = 'Seen by everyone';
+    else {
+      const names = ids.map(A.name).sort();
+      text = 'Seen by ' + (names.length <= 3 ? names.join(', ') : `${names.slice(0, 2).join(', ')} and ${names.length - 2} others`);
+    }
+    return h('div', { class: 'seen', title: ch.kind === 'dm' ? null : ids.map(A.name).sort().join(', ') }, icon('check'), text);
+  }
+
   function renderMessages() {
     const ch = cur();
     if (!ch || !el.msgs) return;
@@ -387,6 +416,10 @@
     const frag = document.createDocumentFragment();
     frag.appendChild(ch.allLoaded ? intro(ch, info) : h('div', { class: 'load-more' }, st.loadingOlder ? 'Loading older messages…' : 'Scroll up for older messages'));
     const list = Y.sorted(ch).concat(ch.outbox);
+    // "Seen by" goes under my newest sent message in DMs and groups
+    let myLast = null;
+    if (ch.kind !== 'public') for (const m of list) if (m.userId === meId() && !m.local && !m.deleted) myLast = m;
+    st.seenSig = seenSig(ch);
     let prev = null, lastDay = '', divDone = false;
     for (const m of list) {
       const day = U.localDay(m.ts);
@@ -398,6 +431,7 @@
       const grouped = !!prev && prev.userId === m.userId && m.ts - prev.ts < 5 * 60000 && !m.replyTo &&
         !prev.deleted && !prev.hidden && prev.verified && m.verified && !m.decryptError && !prev.decryptError;
       frag.appendChild(renderMsg(ch, m, grouped));
+      if (m === myLast) { const r = seenLine(ch, m); if (r) frag.appendChild(r); }
       prev = m;
     }
     UI.set(box, frag);
@@ -995,21 +1029,49 @@
           onclick: () => { m.close(); addMembersDialog(ch); } }, icon('plus'), 'Add people')));
       body.push(h('div', { class: 'note note-ok', style: { marginTop: 0, marginBottom: '14px' } }, icon('lock'),
         h('div', null, h('b', null, 'End-to-end encrypted. '), 'Messages and files are encrypted on this PC before they reach the shared drive. Only the people here can read them, not even the admin. Everything is deleted 7 days after it was sent.')));
+      const creator = Y.isGroupCreator(ch);
+      const admins = Y.groupAdmins(ch);
       const canRemove = Y.canManageGroup(ch) && Y.members(ch).length > 2;
-      body.push(h('div', { class: 'people-list' }, Y.members(ch).map(id => A.users.get(id)).filter(Boolean).map(u =>
-        h('div', { class: 'person' }, UI.avatar(u, 32), h('div', null, h('div', { class: 'nm' }, u.name + (u.id === meId() ? ' (you)' : '')), h('div', { class: 'sub' }, u.id === ch.meta.createdBy ? 'Group creator' : UI.stateLabel(Y.presenceOf(u.id).state))),
-          canRemove && u.id !== meId() ? h('button', { class: 'btn btn-sm', style: { marginLeft: 'auto' }, 'aria-label': `Remove ${u.name} from the group`, onclick: async e => {
-            e.stopPropagation();
-            if (!(await UI.confirm({ title: `Remove ${u.name}?`, text: `${u.name} won’t see new messages in ${chName(ch)}. The group gets a new security key, so they can’t read anything sent from now on. Messages they already received stay on their PC until they expire.`, ok: 'Remove', danger: true }))) return;
-            try { await Y.updateGroup(ch, { removeIds: [u.id] }); m.close(); UI.toast(`Removed ${u.name}`, 'ok'); channelInfoDialog(ch); } catch (ex) { UI.toast(ex.message, 'error'); }
-          } }, 'Remove') : null))));
+      const roleOf = id => id === ch.meta.createdBy ? 'Group creator' : admins.includes(id) ? 'Group admin' : '';
+      const act = (fn, done) => async e => {
+        e.stopPropagation();
+        try { await fn(); m.close(); if (done) UI.toast(done, 'ok'); channelInfoDialog(ch); } catch (ex) { UI.toast(ex.message, 'error'); }
+      };
+      body.push(h('div', { class: 'people-list' }, Y.members(ch).map(id => A.users.get(id)).filter(Boolean).map(u => {
+        const role = roleOf(u.id);
+        const isAdm = admins.includes(u.id);
+        // the creator can remove anyone; group admins can remove regular members
+        const removable = canRemove && u.id !== meId() && u.id !== ch.meta.createdBy && (creator || !isAdm);
+        return h('div', { class: 'person' }, UI.avatar(u, 32),
+          h('div', null, h('div', { class: 'nm' }, u.name + (u.id === meId() ? ' (you)' : '')), h('div', { class: 'sub' }, UI.stateLabel(Y.presenceOf(u.id).state))),
+          h('span', { class: 'row', style: { marginLeft: 'auto', gap: '6px' } },
+            role ? h('span', { class: 'pill' + (u.id === ch.meta.createdBy ? '' : ' grey') }, role) : null,
+            creator && u.id !== meId() ? h('button', { class: 'btn btn-sm', 'aria-label': `${isAdm ? 'Remove group admin rights from' : 'Make'} ${u.name}${isAdm ? '' : ' a group admin'}`,
+              onclick: act(() => Y.updateGroup(ch, { admins: isAdm ? admins.filter(x => x !== u.id) : admins.concat(u.id) }), isAdm ? `${u.name} is no longer a group admin` : `${u.name} is now a group admin`) },
+              icon('shield'), isAdm ? 'Remove admin' : 'Make admin') : null,
+            removable ? h('button', { class: 'btn btn-sm', 'aria-label': `Remove ${u.name} from the group`, onclick: async e => {
+              e.stopPropagation();
+              if (!(await UI.confirm({ title: `Remove ${u.name}?`, text: `${u.name} won’t see new messages in ${chName(ch)}. The group gets a new security key, so they can’t read anything sent from now on. Messages they already received stay on their PC until they expire.`, ok: 'Remove', danger: true }))) return;
+              await act(() => Y.updateGroup(ch, { removeIds: [u.id] }), `Removed ${u.name}`)(e);
+            } }, 'Remove') : null));
+      })));
+      if (creator) body.push(h('div', { class: 'hint muted', style: { fontSize: '13px', marginBottom: '10px' } }, 'Group admins can rename the group, add people and remove regular members. Only you can choose group admins.'));
       if (ch.kind === 'dm' && A.users.get(others[0])) {
         const code = h('div', { class: 'fingerprint' }, '…');
         securityCode(others[0]).then(c => { code.textContent = c; });
         body.push(h('div', { class: 'field' }, h('span', { class: 'label' }, 'Security code'), code,
           h('div', { class: 'hint' }, `Compare this with ${A.name(others[0])}’s screen. If the codes match, nobody has swapped your security keys.`)));
       }
-      body.push(h('div', { class: 'row' }, muteBtn));
+      const leaveBtn = ch.kind === 'group' && !Y.isGroupCreator(ch) ? h('button', { class: 'btn btn-danger', style: { marginLeft: 'auto' }, onclick: async () => {
+        if (!(await UI.confirm({ title: `Leave ${chName(ch)}?`, text: 'It disappears from your sidebar and you won’t get new messages. Only the group’s creator or a group admin can add you back.', ok: 'Leave group', danger: true }))) return;
+        try {
+          await Y.leaveGroup(ch);
+          UI.closeAll();
+          Chat.open(Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]);
+          UI.toast(`You left ${chName(ch)}`, 'ok');
+        } catch (e) { UI.toast(e.message, 'error'); }
+      } }, icon('userX'), 'Leave group') : null;
+      body.push(h('div', { class: 'row' }, muteBtn, leaveBtn));
     }
     const m = UI.modal({ title: ch.kind === 'public' ? '#' + info.name : info.name, cls: 'mid', body });
   }
@@ -1102,6 +1164,10 @@
       h('div', { class: 'seg' }, seg('system', 'System', 'monitor'), seg('light', 'Light', 'sun'), seg('dark', 'Dark', 'moon')),
       notif === 'granted' ? null : item('bell', notif === 'denied' ? 'Desktop notifications are blocked' : 'Turn on desktop notifications', () => SC.app.requestNotifications()),
       item('volume', SC.app.soundOn() ? 'Sound: on' : 'Sound: off', () => { SC.app.setSound(!SC.app.soundOn()); UI.toast(SC.app.soundOn() ? 'Sound on' : 'Sound off'); }),
+      item('check', Y.receiptsOn() ? 'Read receipts: on' : 'Read receipts: off', () => {
+        Y.setReceipts(!Y.receiptsOn());
+        UI.toast(Y.receiptsOn() ? 'Read receipts on' : 'Read receipts off. Others won’t see when you’ve read their messages, and you won’t see theirs.');
+      }),
       h('div', { class: 'menu-sep' }),
       item('key', 'Change password', changePasswordDialog),
       A.isAdmin() ? item('shield', 'Admin settings', adminDialog) : null,
@@ -1218,6 +1284,77 @@
     const m = UI.modal({ title: 'Feedback inbox', cls: 'wide', body: h('div', { class: 'inbox' }, listEl, detail) });
     draw();
     A.loadInbox().then(changed => { if (changed) { draw(); schedule('side'); } }).catch(e => UI.toast(e.message, 'error'));
+  }
+
+  /* ---- announcements ---- */
+  /** Pop up the oldest announcement I haven't acknowledged yet, one at a time. */
+  function showPendingAnnouncement() {
+    if (st.annOpen) return;
+    const a = Y.pendingAnnouncements()[0];
+    if (!a) return;
+    st.annOpen = true;
+    const u = A.users.get(a.userId);
+    const ok = h('button', { class: 'btn btn-primary', onclick: () => { Y.ackAnnouncement(a.id); m.close(); } }, icon('check'), 'Got it');
+    const m = UI.modal({ title: a.title || 'Announcement', cls: 'mid', body: [
+      h('div', { class: 'row', style: { gap: '10px', marginBottom: '12px' } }, UI.avatar(u, 32),
+        h('div', null, h('div', { style: { fontWeight: '600' } }, A.name(a.userId)), h('div', { class: 'muted', style: { fontSize: '13px' } }, (A.roleLabel(a.userId) || 'Admin') + ' · ' + U.formatDateTime(a.ts)))),
+      h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, []) })],
+    foot: [ok], onClose: () => { st.annOpen = false; setTimeout(showPendingAnnouncement, 300); } });
+    SC.app.notify({ title: 'Announcement: ' + (a.title || A.name(a.userId)), body: a.text.slice(0, 140), tag: 'ann-' + a.id });
+  }
+
+  function announcementsDialog() {
+    const admin = A.isAdmin();
+    const listEl = h('div', { class: 'ann-list' });
+    function draw() {
+      const items = Y.announcementList();
+      if (!items.length) { UI.set(listEl, h('div', { class: 'muted', style: { padding: '14px 2px' } }, 'No announcements in the last 30 days.')); return; }
+      UI.set(listEl, items.map(a => {
+        const reach = admin ? Y.announcementReach(a) : null;
+        const missing = reach ? reach.audience.filter(u => !reach.seen.includes(u)) : [];
+        const mineAck = a.userId === meId() || Y.hasAcked(a.id);
+        return h('div', { class: 'ann-item' + (mineAck ? '' : ' new') },
+          h('div', { class: 'ann-top' },
+            h('div', null, h('div', { class: 'ann-title' }, a.title || 'Announcement'),
+              h('div', { class: 'muted', style: { fontSize: '13px' } }, A.name(a.userId) + ' · ' + U.formatDateTime(a.ts))),
+            mineAck ? null : h('button', { class: 'btn btn-sm btn-primary', onclick: () => { Y.ackAnnouncement(a.id); draw(); } }, icon('check'), 'Got it')),
+          h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, []) }),
+          reach ? h('details', { class: 'ann-reach' },
+            h('summary', null, `Seen by ${reach.seen.length} of ${reach.audience.length}`),
+            missing.length ? h('div', { class: 'muted', style: { fontSize: '13px', marginTop: '4px' } }, 'Not seen yet: ' + missing.map(u => u.name).sort().join(', '))
+              : h('div', { class: 'muted', style: { fontSize: '13px', marginTop: '4px' } }, 'Everyone has seen it.'),
+            h('button', { class: 'btn btn-sm', style: { marginTop: '8px' }, onclick: async () => {
+              if (!(await UI.confirm({ title: 'Withdraw this announcement?', text: 'It disappears for everyone, including people who haven’t seen it yet.', ok: 'Withdraw', danger: true }))) return;
+              try { await Y.withdrawAnnouncement(a.id); draw(); UI.toast('Announcement withdrawn', 'ok'); } catch (e) { UI.toast(e.message, 'error'); }
+            } }, icon('trash'), 'Withdraw')) : null);
+      }));
+    }
+    const off = [Y.events.on('announcements', draw), Y.events.on('presence', () => { if (admin) draw(); })];
+    draw();
+    const foot = [h('button', { class: 'btn', onclick: () => m.close() }, 'Close')];
+    if (admin) foot.unshift(h('button', { class: 'btn btn-primary', onclick: newAnnouncementDialog }, icon('plus'), 'New announcement'));
+    const m = UI.modal({ title: 'Announcements', cls: 'mid', body: [
+      h('p', { class: 'muted', style: { fontSize: '14px', marginTop: 0 } }, admin
+        ? 'Announcements pop up for everyone until they click “Got it”. You can see who has read each one.'
+        : 'Messages from the admins to everyone. Shown for 30 days.'), listEl],
+    foot, onClose: () => off.forEach(f => f()) });
+  }
+
+  function newAnnouncementDialog() {
+    const err = h('div', { class: 'form-error hidden', role: 'alert' });
+    const title = h('input', { class: 'input', id: 'an-title', maxlength: 120, placeholder: 'e.g. Office closed on Friday' });
+    const text = h('textarea', { class: 'input', id: 'an-text', rows: 6, maxlength: String(Y.MAX_TEXT), placeholder: 'What does everyone need to know?' });
+    const ok = h('button', { class: 'btn btn-primary' }, icon('megaphone'), 'Post to everyone');
+    ok.addEventListener('click', () => UI.busy(ok, null, async () => {
+      await Y.postAnnouncement({ title: title.value, text: text.value });
+      m.close(); UI.toast('Announcement posted', 'ok');
+    }, err));
+    const m = UI.modal({ title: 'New announcement', cls: 'mid', body: [err,
+      h('div', { class: 'field' }, h('label', { for: 'an-title' }, 'Title (optional)'), title),
+      h('div', { class: 'field' }, h('label', { for: 'an-text' }, 'Message'), text,
+        h('div', { class: 'hint' }, 'Everyone sees it in a pop-up the next time their app checks (within 30 seconds). It isn’t encrypted: anyone with access to the shared drive can read it.'))],
+    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+    title.focus();
   }
 
   /* ---- admin ---- */

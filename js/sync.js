@@ -37,7 +37,7 @@
   const groupMiss = new Map(); // group id → newest activity ts when we last found we weren't a member (re-checked on newer activity)
   const discovering = new Map();
   let readMap = {};
-  let mine = { lastPost: {}, statusText: '', statusTs: 0 };
+  let mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {} };
   let running = false;
   let timer = 0;
 
@@ -73,7 +73,7 @@
   Y.members = function (ch) {
     if (ch.kind === 'public') return A.activeUsers().map(u => u.id);
     if (ch.kind === 'dm') return ch.id.slice(3).split('_');
-    return (ch.meta && ch.meta.members) || [];
+    return ((ch.meta && ch.meta.members) || []).filter(id => !hasLeft(ch, id));
   };
   /** Display info, with the admin's renames/archive flags applied. */
   Y.info = function (ch) {
@@ -124,8 +124,10 @@
     const wraps = genWraps(m, gen);
     const entry = wraps && wraps[me()];
     if (!entry || entry.fp !== A.me.ecdhFp) throw err('No key for you in this group', 'OLD_KEY');
-    const creator = A.users.get(m.createdBy) || await A.loadUser(m.createdBy);
-    const cj = A.findKey(creator, m.keyFrom, 'ecdh');
+    // whoever wrapped my entry (the creator or a group admin) and the ECDH key they used
+    const by = entry.by || m.createdBy;
+    const wrapper = A.users.get(by) || await A.loadUser(by);
+    const cj = A.findKey(wrapper, entry.from || m.keyFrom, 'ecdh');
     if (!cj) throw err('Unknown creator key', 'OLD_KEY');
     const wk = await C.pairKey(A.me.priv.ecdh, cj, 'sankyo-wrap|' + ch.id);
     const aad = 'wrap|' + ch.id + '|' + me() + (gen ? '|' + gen : '');
@@ -165,11 +167,26 @@
     });
   }
 
+  /* ---- leaving a group ----
+   * Members can't sign meta.json, so someone who leaves writes channels/<id>/leave/<userId>.json, signed
+   * by them (one writer per file). Every app hides them straight away; the creator's app then removes
+   * them for real, which rotates the key. A leave only counts if it's newer than the creator's last
+   * add of that person (meta.joined), so they can be added back. */
+  function hasLeft(ch, uid) {
+    const t = ch.leaves && ch.leaves[uid];
+    return !!t && t > ((ch.meta && ch.meta.joined && ch.meta.joined[uid]) || 0);
+  }
+  async function parseLeave(id, uid, raw) {
+    if (!raw || raw.type !== 'leave' || raw.channelId !== id || raw.userId !== uid || typeof raw.ts !== 'number') return 0;
+    return (await verifyRaw(raw)) ? raw.ts : 0;
+  }
+
   /** Removed members still hold old group keys. Accept their files only from before they were removed,
    *  and accept an old key generation only for files written before (or just after) it was replaced. */
   const SKEW = 10 * 60000;
   function groupSenderOk(ch, raw) {
     const m = ch.meta;
+    if (hasLeft(ch, raw.userId) && raw.ts > ch.leaves[raw.userId] + SKEW) return false;
     if (!m.members.includes(raw.userId)) {
       const r = m.removed && m.removed[raw.userId];
       return !!r && raw.ts <= r + SKEW;
@@ -367,7 +384,36 @@
       readMap[ch.id] = last;
       U.ls.set(readKeyName(), readMap);
       recount(ch);
+      if (ch.kind !== 'public' && Y.receiptsOn()) heartbeat(); // tell the others promptly
     }
+  };
+
+  /* ---- read receipts ("Seen by") ----
+   * Each person's presence file carries seen = {conversationId: ts of the newest message they've read},
+   * for DMs and groups only, and only while "Read receipts" is on. Like WhatsApp, it works both ways:
+   * turn it off and you stop seeing other people's receipts too. */
+  const receiptsKey = () => `receipts.${A.ws.id}.${me()}`;
+  Y.receiptsOn = () => U.ls.get(receiptsKey(), true) !== false;
+  Y.setReceipts = function (on) { U.ls.set(receiptsKey(), !!on); heartbeat(); Y.events.emit('presence', true); };
+  function mySeen() {
+    if (!Y.receiptsOn()) return undefined;
+    const out = {}, floor = Date.now() - 8 * U.DAY_MS;
+    for (const ch of chans.values()) {
+      if (ch.kind === 'public') continue;
+      const t = readMap[ch.id] || 0;
+      if (t > floor) out[ch.id] = t;
+    }
+    return out;
+  }
+  /** Other members who have read up to (at least) ts in this conversation. */
+  Y.seenBy = function (ch, ts) {
+    if (!ch || ch.kind === 'public' || !Y.receiptsOn()) return [];
+    return Y.members(ch).filter(id => {
+      if (id === me()) return false;
+      const p = Y.presence.get(id);
+      const t = p && p.data && p.data.seen && p.data.seen[ch.id];
+      return typeof t === 'number' && t >= ts;
+    });
   };
   Y.totalUnread = () => Array.from(chans.values()).reduce((n, ch) => n + (Y.info(ch).archived ? 0 : ch.unread), 0);
 
@@ -589,14 +635,14 @@
     return makeGroup([me()].concat(others).sort(), name);
   };
 
-  /** Wrap the group key for each of these people (from my ECDH key to theirs). */
+  /** Wrap the group key for each of these people (from my ECDH key to theirs; `by`/`from` say whose). */
   async function wrapFor(id, rawKey, uids, keys, gen) {
     for (const uid of uids) {
       const u = A.users.get(uid) || await A.loadUser(uid);
       if (!u || A.isRemoved(uid)) throw err('One of the people you picked is no longer in the workspace.');
       const wk = await C.pairKey(A.me.priv.ecdh, u.keys.ecdh, 'sankyo-wrap|' + id);
       const enc = await C.encryptJSON(wk, { k: U.b64(rawKey) }, 'wrap|' + id + '|' + uid + (gen ? '|' + gen : ''));
-      keys[uid] = { fp: u.ecdhFp, iv: enc.iv, ct: enc.ct };
+      keys[uid] = { fp: u.ecdhFp, iv: enc.iv, ct: enc.ct, by: me(), from: A.me.ecdhFp };
     }
     return keys;
   }
@@ -605,7 +651,7 @@
     const id = 'g_' + U.rand(8);
     const rawKey = C.randomRaw();
     const keys = await wrapFor(id, rawKey, members, {});
-    const meta = { v: 1, id, type: 'group', members, createdBy: me(), ts: Date.now(), rev: 0, keyFrom: A.me.ecdhFp, keys, kid: A.me.signFp };
+    const meta = { v: 1, id, type: 'group', members, createdBy: me(), by: me(), ts: Date.now(), rev: 0, keyFrom: A.me.ecdhFp, keys, kid: A.me.signFp };
     const aes = await C.importAes(rawKey);
     if (name) meta.nameEnc = await C.encryptJSON(aes, { name }, 'name|' + id);
     meta.sig = await C.sign(A.me.priv.sign, meta);
@@ -629,28 +675,59 @@
     }).catch(e => console.warn('group name', ch.id, e));
   }
 
-  Y.canManageGroup = ch => !!ch && ch.kind === 'group' && !!ch.meta && ch.meta.createdBy === me();
+  /* ---- group roles ----
+   * The creator can appoint group admins. The admin list is its own block, meta.admins = {id, list, arev, kid, sig},
+   * signed by the creator alone, so an admin can carry it into a meta.json they sign but can't change it.
+   * meta.json may be signed by the creator or by anyone on that list (meta.by says who). */
+  Y.isGroupCreator = (ch, uid = me()) => !!ch && ch.kind === 'group' && !!ch.meta && ch.meta.createdBy === uid;
+  Y.groupAdmins = ch => {
+    const a = ch && ch.kind === 'group' && ch.meta && ch.meta.admins;
+    return a && Array.isArray(a.list) ? a.list.filter(id => ch.meta.members.includes(id) && !hasLeft(ch, id)) : [];
+  };
+  Y.isGroupAdmin = (ch, uid = me()) => Y.isGroupCreator(ch, uid) || Y.groupAdmins(ch).includes(uid);
+  Y.canManageGroup = ch => Y.isGroupAdmin(ch, me());
+
+  async function verifyAdmins(meta) {
+    const a = meta.admins;
+    if (!a) return true;
+    if (a.id !== meta.id || !Array.isArray(a.list) || typeof a.arev !== 'number') return false;
+    const creator = A.users.get(meta.createdBy) || await A.loadUser(meta.createdBy);
+    return C.verify(A.findKey(creator, a.kid, 'sign'), a);
+  }
+  async function signAdmins(id, list, arev) {
+    const a = { id, list: U.uniq(list).sort(), arev, kid: A.me.signFp };
+    a.sig = await C.sign(A.me.priv.sign, a);
+    return a;
+  }
 
   /**
-   * Creator only: rename the group, add people and/or remove people. meta.json is rewritten with a
-   * higher `rev` and re-signed; only the creator ever writes it, so there is still a single writer.
+   * Group creator or group admin: rename, add, remove; only the creator sets `admins`.
+   * meta.json is rewritten with a higher `rev` and re-signed by whoever made the change.
    * People added get the current key, so they can read what is still in the group (7 days at most).
-   * Removing anyone rotates the key: a new generation is wrapped only for the people who stay, so the
-   * removed people can't read anything sent afterwards.
+   * Removing anyone rotates the key: a new generation is wrapped only for the people who stay.
    */
-  Y.updateGroup = async function (ch, { name, addIds, removeIds }) {
-    if (!Y.canManageGroup(ch)) throw err('Only the person who created this group can change it.');
+  Y.updateGroup = async function (ch, { name, addIds, removeIds, admins }) {
     if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
+    await refreshGroupMeta(ch, 0, true); // build on the newest version another admin may have written
+    if (!chans.has(ch.id)) throw err('You’re no longer in this group.');
+    if (!Y.canManageGroup(ch)) throw err('Only the group’s creator and group admins can change it.');
     const old = ch.meta;
-    if (old.keyFrom !== A.me.ecdhFp) throw err('Your password was reset after you made this group, so it can’t be changed any more. Create a new group instead.');
+    const creator = Y.isGroupCreator(ch);
+    const oldAdmins = (old.admins && old.admins.list) || [];
     const drop = U.uniq((removeIds || []).filter(id => old.members.includes(id) && id !== me()));
+    if (drop.includes(old.createdBy)) throw err('Nobody can remove the group’s creator.');
+    if (!creator && drop.some(id => oldAdmins.includes(id) && !hasLeft(ch, id))) throw err('Only the group’s creator can remove a group admin.');
+    if (!creator && admins !== undefined) throw err('Only the group’s creator can choose group admins.');
     const add = U.uniq((addIds || []).filter(id => !old.members.includes(id)));
     const members = old.members.filter(id => !drop.includes(id)).concat(add).sort();
     if (members.length > Y.MAX_GROUP) throw err(`Group chats can have up to ${Y.MAX_GROUP} people.`);
     if (members.length < 2) throw err('A group needs at least one other person.');
     const now = Date.now();
     const gen = curGen(ch);
-    const oldRaw = await groupRaw(ch, gen);
+    let oldRaw;
+    try { oldRaw = await groupRaw(ch, gen); } catch {
+      throw err('Your security key changed (for example after a password reset), so you can’t change this group yet. Ask another group admin to change something in the group (for example add or rename); that restores your access.');
+    }
     let nameText = null;
     if (name !== undefined) {
       nameText = Y.normalizeGroupName(name);
@@ -658,12 +735,23 @@
     } else if (old.nameEnc) {
       nameText = (await C.decryptJSON(await C.importAes(oldRaw), old.nameEnc, 'name|' + ch.id)).name;
     }
-    const meta = Object.assign({}, old, { members, rev: (old.rev || 0) + 1, updated: now, kid: A.me.signFp });
+    const meta = Object.assign({}, old, { members, rev: (old.rev || 0) + 1, updated: now, by: me(), kid: A.me.signFp });
     delete meta.sig;
     const removed = Object.assign({}, old.removed);
     drop.forEach(id => { removed[id] = now; });
     add.forEach(id => { delete removed[id]; });
     meta.removed = removed;
+    const joined = Object.assign({}, old.joined);
+    add.forEach(id => { joined[id] = now; });
+    drop.forEach(id => { delete joined[id]; });
+    meta.joined = joined;
+    // the admin list: only the creator re-signs it (dropping people who left or were removed)
+    if (creator) {
+      const want = U.uniq((admins !== undefined ? admins : oldAdmins).filter(id => members.includes(id) && id !== me() && (add.includes(id) || !hasLeft(ch, id))));
+      if (want.slice().sort().join() !== oldAdmins.slice().sort().join()) {
+        meta.admins = await signAdmins(ch.id, want, ((old.admins && old.admins.arev) || 0) + 1);
+      }
+    }
     let rawKey = oldRaw;
     if (drop.length) {
       // new key generation; keep the old one (minus the removed people) so the rest can read history
@@ -697,7 +785,55 @@
     Y.events.emit('group', ch);
   }
 
-  /** The creator removed me: drop the group from this PC (they may add me back later). */
+  /** Pick up leave files. The creator's app turns them into a real removal; a group admin's app does it
+   *  if the creator hasn't within 10 minutes (and never for another group admin). */
+  async function refreshLeaves(ch) {
+    if (ch.leaveBusy || !chans.has(ch.id)) return;
+    ch.leaveBusy = true;
+    try {
+      const dir = `channels/${ch.id}/leave`;
+      const names = (await S.list(dir, 'file')).filter(n => /^[a-z0-9]{4}\.json$/.test(n));
+      if (!ch.leaveMtimes) ch.leaveMtimes = {};
+      const leaves = Object.assign({}, ch.leaves);
+      let changed = false;
+      for (const n of names) {
+        const uid = n.slice(0, 4);
+        const f = await S.readFile(`${dir}/${n}`);
+        if (!f || ch.leaveMtimes[uid] === f.lastModified) continue;
+        ch.leaveMtimes[uid] = f.lastModified;
+        let raw = null;
+        try { raw = JSON.parse(await f.text()); } catch { /* ignore */ }
+        const ts = await parseLeave(ch.id, uid, raw);
+        if (ts && ts !== leaves[uid]) { leaves[uid] = ts; changed = true; }
+      }
+      if (changed) { ch.leaves = leaves; Y.events.emit('channels'); Y.events.emit('group', ch); }
+      if (Y.canManageGroup(ch) && Y.connected) {
+        const creator = Y.isGroupCreator(ch);
+        const adminList = (ch.meta.admins && ch.meta.admins.list) || [];
+        const gone = ch.meta.members.filter(id => id !== me() && hasLeft(ch, id) &&
+          (creator || (!adminList.includes(id) && Date.now() - ch.leaves[id] > SKEW)));
+        // the last other person leaving can't be a removal (a group needs two people); they stay hidden instead
+        if (gone.length && ch.meta.members.length - gone.length >= 2) await Y.updateGroup(ch, { removeIds: gone });
+      }
+    } catch (e) { handleErr(e); } finally { ch.leaveBusy = false; }
+  }
+
+  /** Anyone but the creator can leave a group. */
+  Y.leaveGroup = async function (ch) {
+    if (!ch || ch.kind !== 'group') return;
+    if (Y.isGroupCreator(ch)) throw err('You created this group, so you can’t leave it. You can remove the other people instead.');
+    if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
+    const ts = Date.now();
+    const raw = { v: 1, type: 'leave', channelId: ch.id, userId: me(), ts, kid: A.me.signFp };
+    raw.sig = await C.sign(A.me.priv.sign, raw);
+    await S.writeJSON(`channels/${ch.id}/leave/${me()}.json`, raw);
+    chans.delete(ch.id);
+    groupMiss.set(ch.id, ts);
+    noteMyPost(ch.id, ts);
+    Y.events.emit('channels');
+  };
+
+  /** I was removed: drop the group from this PC (I may be added back later). */
   function leftGroup(ch, ts) {
     chans.delete(ch.id);
     groupMiss.set(ch.id, ts || Date.now());
@@ -705,28 +841,37 @@
     Y.events.emit('groupGone', ch);
   }
 
-  /** Re-read a group's meta.json when it changed on disk; accept it only if the same creator signed a newer rev. */
-  async function refreshGroupMeta(ch, ts) {
-    if (ch.metaBusy) return;
-    ch.metaBusy = true;
+  /** Re-read a group's meta.json when it changed on disk. Accept it only if it's a newer rev of the same
+   *  group, signed by its creator or a group admin, that doesn't roll the admin list back. */
+  async function refreshGroupMeta(ch, ts, wait) {
+    if (ch.metaBusy) { if (wait) await ch.metaBusy; return; }
+    let done;
+    ch.metaBusy = new Promise(r => { done = r; });
     try {
       const r = await S.readJSONIfChanged(`channels/${ch.id}/meta.json`, ch.metaMtime);
       if (r.unchanged || r.missing || !r.data) return;
       ch.metaMtime = r.lastModified;
       const m = r.data, old = ch.meta;
       if (m.type !== 'group' || m.createdBy !== old.createdBy || !((m.rev || 0) > (old.rev || 0))) return;
+      if (((m.admins && m.admins.arev) || 0) < ((old.admins && old.admins.arev) || 0)) return;
       if (!Array.isArray(m.members) || !m.keys) return;
       if (!(await verifyMeta(m, ch.id))) return;
       if (!m.members.includes(me()) || !m.keys[me()]) return leftGroup(ch, ts);
       applyGroupMeta(ch, m);
-    } catch (e) { console.warn('group meta', ch.id, e); } finally { ch.metaBusy = false; }
+    } catch (e) { console.warn('group meta', ch.id, e); } finally { ch.metaBusy = null; done(); }
   }
 
   /* ================= discovery ================= */
 
   async function verifyMeta(meta, id) {
     if (!meta || meta.id !== id) return false;
-    const u = A.users.get(meta.createdBy) || await A.loadUser(meta.createdBy);
+    let signer = meta.createdBy;
+    if (meta.type === 'group') {
+      if (!(await verifyAdmins(meta))) return false;
+      signer = meta.by || meta.createdBy;
+      if (signer !== meta.createdBy && !(meta.admins && meta.admins.list.includes(signer))) return false;
+    }
+    const u = A.users.get(signer) || await A.loadUser(signer);
     const key = A.findKey(u, meta.kid, 'sign');
     return !!key && await C.verify(key, meta);
   }
@@ -750,10 +895,15 @@
       if (kind === 'public' && !A.canActAt(meta.createdBy, meta.kid, meta.ts)) { notMine.add(id); return null; }
       // Not a member (yet): the creator may add us later, so re-check when the group shows newer activity.
       if (kind === 'group' && !(Array.isArray(meta.members) && meta.members.includes(me()) && meta.keys && meta.keys[me()])) { if (!groupMiss.has(id)) groupMiss.set(id, 0); return null; }
+      if (kind === 'group') {
+        const left = await parseLeave(id, me(), await S.readJSON(`channels/${id}/leave/${me()}.json`));
+        if (left && left > ((meta.joined && meta.joined[me()]) || 0)) { groupMiss.set(id, Math.max(groupMiss.get(id) || 0, left)); return null; }
+      }
       groupMiss.delete(id);
       failed.delete(id);
       const ch = addChan(newChan(id, meta));
       loadGroupName(ch);
+      if (kind === 'group') refreshLeaves(ch);
       return ch;
     })();
     discovering.set(id, p);
@@ -786,11 +936,13 @@
       const cur = await S.readJSON(`presence/${me()}.json`);
       if (cur && cur.userId === me()) {
         for (const [k, v] of Object.entries(cur.lastPost || {})) if (typeof v === 'number' && !(mine.lastPost[k] >= v)) mine.lastPost[k] = v;
+        for (const [k, v] of Object.entries(cur.acks || {})) if (typeof v === 'number' && !(mine.acks[k] >= v)) mine.acks[k] = v;
         if ((cur.statusTs || 0) > mine.statusTs) { mine.statusText = cur.statusText || ''; mine.statusTs = cur.statusTs; }
       }
       const cutoff = Date.now() - 14 * U.DAY_MS;
       for (const k of Object.keys(mine.lastPost)) if (mine.lastPost[k] < cutoff) delete mine.lastPost[k];
-      const data = { v: 1, userId: me(), lastSeen: Date.now(), status: status || Y.myStatus(), statusText: mine.statusText, statusTs: mine.statusTs, lastPost: mine.lastPost };
+      for (const k of Object.keys(mine.acks)) { const pn = U.parseMsgName(k + '.json'); if (!pn || pn.ts < Date.now() - Y.ANN_DAYS * U.DAY_MS) delete mine.acks[k]; }
+      const data = { v: 1, userId: me(), lastSeen: Date.now(), status: status || Y.myStatus(), statusText: mine.statusText, statusTs: mine.statusTs, lastPost: mine.lastPost, seen: mySeen(), acks: mine.acks };
       await S.writeJSON(`presence/${me()}.json`, data);
       Y.presence.set(me(), { data, mtime: 0 });
     } catch (e) { handleErr(e); } finally {
@@ -823,7 +975,7 @@
       }
       return discover(id).then(c => { if (c) noteActivity(id, ts); }).catch(handleErr);
     }
-    if (ch.kind === 'group' && ts > (ch.metaSeen || 0)) { ch.metaSeen = ts; refreshGroupMeta(ch, ts); }
+    if (ch.kind === 'group' && ts > (ch.metaSeen || 0)) { ch.metaSeen = ts; refreshGroupMeta(ch, ts).then(() => refreshLeaves(ch)); }
     if (ts > ch.lastKnown && ts > ch.dirtyTo) ch.dirtyTo = ts;
     return null;
   }
@@ -930,7 +1082,7 @@
     { every: 2000, fn: pollOpen },
     { every: 5000, fn: async () => { await pollPresence(); await processDirty(); } },
     { every: 10000, fn: () => heartbeat(), always: true },
-    { every: 30000, fn: async () => { await A.refreshWorkspace(); await A.refreshAdminLog(); if (await A.loadInbox()) Y.events.emit('inbox'); } },
+    { every: 30000, fn: async () => { await A.refreshWorkspace(); await A.refreshAdminLog(); await Y.refreshAnnouncements(); if (await A.loadInbox()) Y.events.emit('inbox'); } },
     { every: 60000, fn: async () => { await A.refreshUsers(); await rescanChannels(); purgeExpired(); } },
     { every: 3600000, fn: sweep, first: 15000 },
   ];
@@ -968,14 +1120,17 @@
     Y.startedAt = Date.now();
     Y.connected = true;
     readMap = U.ls.get(readKeyName(), {});
-    mine = { lastPost: {}, statusText: '', statusTs: 0 };
+    mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {} };
+    Y.announcements.clear(); badAnn.clear();
     const cur = await S.readJSON(`presence/${me()}.json`);
     if (cur && cur.userId === me()) {
       mine.lastPost = Object.assign({}, cur.lastPost);
       mine.statusText = cur.statusText || '';
       mine.statusTs = cur.statusTs || 0;
+      for (const [k, v] of Object.entries(cur.acks || {})) if (typeof v === 'number') mine.acks[k] = v;
     }
     try { await A.refreshAdminLog(); } catch (e) { console.warn(e); }
+    try { await Y.refreshAnnouncements(); } catch (e) { console.warn(e); }
     await rescanChannels();
     await heartbeat();
     await pollPresence();
@@ -990,6 +1145,89 @@
     if (writeOffline && A.me) { try { await heartbeat('offline'); } catch { /* ignore */ } }
     chans.clear(); Y.presence.clear(); notMine.clear(); failed.clear(); groupMiss.clear();
     Y.openId = null;
+  };
+
+  /* ================= announcements =================
+   * An admin posts announcements/<ts>_<userId>_<rand>.json, signed by them; every app checks the signer
+   * was an admin at that time (A.canActAt) and ignores anything else. Each person's app pops it up until
+   * they click "Got it", and records that in their presence file as acks = {announcementId: ts}, which is
+   * how admins see who has read it. Announcements show for 30 days. Withdrawing one deletes its file. */
+  Y.ANN_DAYS = 30;
+  /** @type {Map<string, {id, userId, ts, title, text}>} */
+  Y.announcements = new Map();
+  const badAnn = new Set();
+
+  Y.refreshAnnouncements = async function () {
+    const floor = Date.now() - Y.ANN_DAYS * U.DAY_MS;
+    const names = (await S.list('announcements', 'file')).filter(n => U.MSG_RE.test(n) && !n.includes('.ev.'));
+    const present = new Set(names.map(n => n.slice(0, -5)));
+    let changed = false;
+    for (const id of Array.from(Y.announcements.keys())) if (!present.has(id)) { Y.announcements.delete(id); changed = true; }
+    for (const n of names) {
+      const id = n.slice(0, -5);
+      if (Y.announcements.has(id) || badAnn.has(id)) continue;
+      const pn = U.parseMsgName(n);
+      if (!pn || pn.ts < floor) continue;
+      const raw = await S.readJSON('announcements/' + n);
+      const ok = raw && raw.type === 'announcement' && raw.id === id && raw.userId === pn.userId && raw.ts === pn.ts &&
+        typeof raw.text === 'string' && await verifyRaw(raw) && A.canActAt(raw.userId, raw.kid, raw.ts);
+      if (!ok) { badAnn.add(id); continue; }
+      Y.announcements.set(id, { id, userId: raw.userId, ts: raw.ts, title: String(raw.title || '').slice(0, 120), text: raw.text.slice(0, Y.MAX_TEXT) });
+      changed = true;
+    }
+    for (const [id, a] of Y.announcements) if (a.ts < floor) { Y.announcements.delete(id); changed = true; }
+    if (changed) Y.events.emit('announcements');
+    return changed;
+  };
+
+  /** Newest first. */
+  Y.announcementList = () => Array.from(Y.announcements.values()).sort((a, b) => b.ts - a.ts);
+  Y.hasAcked = id => !!mine.acks[id];
+  /** Announcements I still need to see (not my own), oldest first. */
+  Y.pendingAnnouncements = () => Y.announcementList().filter(a => a.userId !== me() && !mine.acks[a.id]).reverse();
+
+  Y.ackAnnouncement = function (id) {
+    if (mine.acks[id]) return;
+    mine.acks[id] = Date.now();
+    heartbeat();
+    Y.events.emit('announcements');
+  };
+
+  /** Who should see it (everyone active who existed when it was posted, except the author), and who has. */
+  Y.announcementReach = function (a) {
+    const audience = A.activeUsers().filter(u => u.id !== a.userId && !(u.created > a.ts));
+    const seen = audience.filter(u => {
+      if (u.id === me()) return !!mine.acks[a.id];
+      const pr = Y.presence.get(u.id);
+      return !!(pr && pr.data && pr.data.acks && pr.data.acks[a.id]);
+    });
+    return { audience, seen };
+  };
+
+  Y.postAnnouncement = async function ({ title, text }) {
+    if (!A.isAdmin()) throw err('Only admins can post announcements.');
+    if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
+    title = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    text = String(text || '').trim();
+    if (!text) throw err('Write the announcement first.');
+    if (text.length > Y.MAX_TEXT) throw err(`Announcements can be up to ${Y.MAX_TEXT} characters.`);
+    const ts = Date.now();
+    const id = `${ts}_${me()}_${U.rand(4)}`;
+    const raw = { v: 1, id, type: 'announcement', title, text, userId: me(), ts, kid: A.me.signFp };
+    raw.sig = await C.sign(A.me.priv.sign, raw);
+    await S.writeJSON(`announcements/${id}.json`, raw);
+    Y.announcements.set(id, { id, userId: me(), ts, title, text });
+    Y.events.emit('announcements');
+    return id;
+  };
+
+  Y.withdrawAnnouncement = async function (id) {
+    const a = Y.announcements.get(id);
+    if (!a) return;
+    if (!A.isAdmin()) throw err('Only admins can withdraw announcements.');
+    await S.remove(`announcements/${id}.json`);
+    Y.announcements.delete(id);
+    Y.events.emit('announcements');
   };
 
   /* ================= search & export ================= */
