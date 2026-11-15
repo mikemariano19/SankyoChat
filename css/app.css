@@ -453,3 +453,31 @@ kbd { font: 12px var(--font); border: 1px solid currentColor; border-radius: 5px
 .toast.ok { background: #166534; }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+/* ---- chat bubbles: other people on the left, you on the right ---- */
+.msg-main { display: flex; flex-direction: column; align-items: flex-start; }
+.msg-main > * { max-width: min(680px, 78%); }
+.msg-main > .msg-head, .msg-main > .msg-edit { max-width: 100%; }
+.msg-edit { align-self: stretch; }
+.msg-text:not(.gone):not(.big-emoji) { display: inline-block; padding: 7px 12px; border-radius: 16px; background: var(--surface-2); line-height: 1.45; }
+.msg.theirs:not(.grouped) .msg-text:not(.gone):not(.big-emoji) { border-top-left-radius: 5px; }
+.msg-head { margin-bottom: 2px; }
+.msg.mine { flex-direction: row-reverse; }
+.msg.mine .msg-main { align-items: flex-end; }
+.msg.mine .msg-head { justify-content: flex-end; }
+.msg.mine .msg-text:not(.gone):not(.big-emoji) { background: var(--accent); color: var(--on-accent); border-top-right-radius: 5px; }
+.msg.mine.grouped .msg-text:not(.gone):not(.big-emoji) { border-top-right-radius: 16px; }
+.msg.mine .msg-text a { color: inherit; text-decoration: underline; }
+.msg.mine .msg-text .mention { background: rgba(255, 255, 255, .22); color: inherit; }
+.msg.mine .msg-text code.inline { background: rgba(255, 255, 255, .18); color: inherit; }
+.msg.mine .msg-text pre.code-block { background: rgba(0, 0, 0, .18); border-color: rgba(255, 255, 255, .2); color: inherit; }
+.msg.mine .msg-text .edited, .msg.mine .msg-text .msg-status { color: rgba(255, 255, 255, .78); }
+.msg.mine .msg-reply { border-left: 0; border-right: 3px solid var(--border-strong); padding: 1px 10px 1px 0; text-align: right; }
+.msg.mine .msg-atts, .msg.mine .msg-reacts { justify-content: flex-end; }
+.msg.mine .msg-failed { justify-content: flex-end; }
+.msg.mine .msg-tools { right: auto; left: 16px; }
+.msg.mine.pending .msg-text:not(.gone), .msg.mine.failed .msg-text:not(.gone) { color: var(--on-accent); opacity: .7; }
+.msg.mine.mention, .msg.mine:hover { background: transparent; }
+.msg:hover { background: transparent; }
+.msg:hover .msg-text:not(.gone):not(.big-emoji) { filter: brightness(.97); }
+@media (max-width: 600px) { .msg-main > * { max-width: 88%; } }

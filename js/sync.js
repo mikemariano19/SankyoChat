@@ -11,7 +11,7 @@
   Y.RETENTION = 7 * U.DAY_MS;
   Y.MAX_FILE = 5 * 1024 * 1024;
   Y.MAX_TEXT = 4000;
-  Y.MAX_GROUP = 8;
+  Y.MAX_GROUP = 20;
   Y.MAX_ATTACH = 10;
 
   /**
@@ -34,6 +34,7 @@
 
   const notMine = new Set();   // channel ids verified as not ours
   const failed = new Set();    // channel ids whose meta couldn't be read (retried on rescan)
+  const groupMiss = new Map(); // group id → newest activity ts when we last found we weren't a member (re-checked on newer activity)
   const discovering = new Map();
   let readMap = {};
   let mine = { lastPost: {}, statusText: '', statusTs: 0 };
@@ -50,7 +51,7 @@
     return {
       id, kind: kindOf(id), meta: meta || null, msgs: new Map(), pendingEvents: new Map(), reactState: new Map(),
       seen: new Set(), loadedDays: new Set(), days: null, lastKnown: 0, dirtyTo: 0, unread: 0, mentions: 0,
-      outbox: [], keyP: null, allLoaded: false, version: 0, lastActivity: 0,
+      outbox: [], keyPs: null, allLoaded: false, version: 0, lastActivity: 0,
     };
   }
   function addChan(ch) {
@@ -82,7 +83,7 @@
     }
     if (ch.kind === 'dm') return { name: A.name(Y.dmOther(ch)), description: '', archived: false };
     const names = Y.members(ch).filter(id => id !== me()).map(A.name).sort();
-    return { name: names.join(', '), description: '', archived: false };
+    return { name: ch.groupName || names.join(', '), description: ch.groupName ? names.join(', ') : '', archived: false };
   };
   Y.isMuted = id => !!U.ls.get(`muted.${A.ws.id}.${me()}`, {})[id];
   Y.setMuted = function (id, on) {
@@ -108,24 +109,42 @@
     }
     return C.pairKey(A.me.priv.ecdh, theirJwk, 'sankyo-dm|' + ch.id);
   }
-  function groupKey(ch) {
-    if (!ch.keyP) {
-      ch.keyP = (async () => {
-        const m = ch.meta;
-        const entry = m.keys && m.keys[me()];
-        if (!entry || entry.fp !== A.me.ecdhFp) throw err('No key for you in this group', 'OLD_KEY');
-        const creator = A.users.get(m.createdBy) || await A.loadUser(m.createdBy);
-        const cj = A.findKey(creator, m.keyFrom, 'ecdh');
-        if (!cj) throw err('Unknown creator key', 'OLD_KEY');
-        const wk = await C.pairKey(A.me.priv.ecdh, cj, 'sankyo-wrap|' + ch.id);
-        const { k } = await C.decryptJSON(wk, entry, 'wrap|' + ch.id + '|' + me());
-        return C.importAes(U.unb64(k));
-      })();
-      ch.keyP.catch(() => { setTimeout(() => { ch.keyP = null; }, 30000); });
-    }
-    return ch.keyP;
+  /* Group keys have generations. Removing someone starts a new generation (meta.gen) with a fresh key
+   * wrapped only for the people who stay. Earlier generations live on in meta.past = [{gen, keys, until}]
+   * (minus the removed people's wraps) so members can still read older messages. */
+  const curGen = ch => (ch.meta && ch.meta.gen) || 0;
+  function genWraps(m, gen) {
+    if (gen === (m.gen || 0)) return m.keys;
+    const p = Array.isArray(m.past) && m.past.find(x => x && x.gen === gen);
+    return p ? p.keys : null;
   }
-  const readKey = (ch, enc) => ch.kind === 'dm' ? dmKey(ch, enc) : groupKey(ch);
+  /** The group's raw AES key for a generation, unwrapped from my entry. */
+  async function groupRaw(ch, gen) {
+    const m = ch.meta;
+    const wraps = genWraps(m, gen);
+    const entry = wraps && wraps[me()];
+    if (!entry || entry.fp !== A.me.ecdhFp) throw err('No key for you in this group', 'OLD_KEY');
+    const creator = A.users.get(m.createdBy) || await A.loadUser(m.createdBy);
+    const cj = A.findKey(creator, m.keyFrom, 'ecdh');
+    if (!cj) throw err('Unknown creator key', 'OLD_KEY');
+    const wk = await C.pairKey(A.me.priv.ecdh, cj, 'sankyo-wrap|' + ch.id);
+    const aad = 'wrap|' + ch.id + '|' + me() + (gen ? '|' + gen : '');
+    const { k } = await C.decryptJSON(wk, entry, aad);
+    return U.unb64(k);
+  }
+  function groupKey(ch, gen) {
+    if (gen === undefined) gen = curGen(ch);
+    if (!ch.keyPs) ch.keyPs = new Map();
+    let p = ch.keyPs.get(gen);
+    if (!p) {
+      p = groupRaw(ch, gen).then(raw => C.importAes(raw));
+      ch.keyPs.set(gen, p);
+      p.catch(() => { setTimeout(() => { if (ch.keyPs.get(gen) === p) ch.keyPs.delete(gen); }, 30000); });
+    }
+    return p;
+  }
+  const encGen = enc => (enc && Number.isInteger(enc.g) && enc.g > 0 ? enc.g : 0);
+  const readKey = (ch, enc) => ch.kind === 'dm' ? dmKey(ch, enc) : groupKey(ch, encGen(enc));
 
   /* ================= reading ================= */
 
@@ -141,9 +160,24 @@
       const o = { fileId: a.fileId, name: a.name.slice(0, 200), size: Number(a.size) || 0, type: String(a.type || '').slice(0, 100) };
       const w = Math.round(Number(a.w)), hgt = Math.round(Number(a.h));
       if (w > 0 && hgt > 0 && w <= 20000 && hgt <= 20000) { o.w = w; o.h = hgt; }
-      if (kind === 'public') o.path = String(a.path || ''); else o.iv = String(a.iv || '');
+      if (kind === 'public') o.path = String(a.path || ''); else { o.iv = String(a.iv || ''); if (Number.isInteger(a.g) && a.g > 0) o.g = a.g; }
       return o;
     });
+  }
+
+  /** Removed members still hold old group keys. Accept their files only from before they were removed,
+   *  and accept an old key generation only for files written before (or just after) it was replaced. */
+  const SKEW = 10 * 60000;
+  function groupSenderOk(ch, raw) {
+    const m = ch.meta;
+    if (!m.members.includes(raw.userId)) {
+      const r = m.removed && m.removed[raw.userId];
+      return !!r && raw.ts <= r + SKEW;
+    }
+    const g = encGen(raw.enc);
+    if (g >= curGen(ch)) return true;
+    const later = (Array.isArray(m.past) ? m.past : []).find(p => p && p.gen === g);
+    return !later || raw.ts <= later.until + SKEW;
   }
 
   /** Turn a raw file into a plain message/event object (decrypting DMs). */
@@ -159,6 +193,7 @@
         out.decryptError = true; body = {};
       }
     }
+    if (ch.kind === 'group' && out.verified && !groupSenderOk(ch, raw)) out.verified = false;
     PAYLOAD.forEach(k => { if (body[k] !== undefined) out[k] = body[k]; });
     out.text = typeof out.text === 'string' ? out.text.slice(0, Y.MAX_TEXT + 100) : '';
     out.mentions = Array.isArray(out.mentions) ? out.mentions.filter(x => typeof x === 'string').slice(0, 60) : [];
@@ -352,7 +387,11 @@
         if (!other) throw err('Unknown user');
         raw.enc = await C.encryptJSON(await dmKey(ch), clean, aad);
         raw.enc.s = A.me.ecdhFp; raw.enc.r = other.ecdhFp;
-      } else raw.enc = await C.encryptJSON(await groupKey(ch), clean, aad);
+      } else {
+        const gen = curGen(ch);
+        raw.enc = await C.encryptJSON(await groupKey(ch, gen), clean, aad);
+        if (gen) raw.enc.g = gen;
+      }
     }
     raw.sig = await C.sign(A.me.priv.sign, raw);
     return raw;
@@ -394,10 +433,11 @@
         await S.write(path, f);
         out.push(Object.assign(base, { path }));
       } else {
-        const key = ch.kind === 'dm' ? await dmKey(ch) : await groupKey(ch);
+        const gen = ch.kind === 'group' ? curGen(ch) : 0;
+        const key = ch.kind === 'dm' ? await dmKey(ch) : await groupKey(ch, gen);
         const enc = await C.encryptBytes(key, await f.arrayBuffer(), 'file|' + fileId);
         await S.write(`files/${fileId}.bin`, enc.data);
-        out.push(Object.assign(base, { iv: enc.iv }));
+        out.push(Object.assign(base, { iv: enc.iv }, gen ? { g: gen } : null));
       }
     }
     return out;
@@ -498,7 +538,7 @@
     }
     const f = await S.readFile(`files/${att.fileId}.bin`);
     if (!f) throw err('This file has been deleted.');
-    const pt = await C.decryptBytes(await readKey(ch, msg.enc), att.iv, await f.arrayBuffer(), 'file|' + att.fileId);
+    const pt = await C.decryptBytes(await readKey(ch, ch.kind === 'group' ? { g: att.g || 0 } : msg.enc), att.iv, await f.arrayBuffer(), 'file|' + att.fileId);
     return new Blob([pt], { type: att.type || 'application/octet-stream' });
   };
 
@@ -532,25 +572,155 @@
     }
     if (others.length + 1 > Y.MAX_GROUP) throw err(`Group messages can have up to ${Y.MAX_GROUP} people.`);
     const members = [me()].concat(others).sort();
-    const existing = Array.from(chans.values()).find(c => c.kind === 'group' && c.meta.members.slice().sort().join() === members.join());
+    const existing = Array.from(chans.values()).find(c => c.kind === 'group' && !c.meta.nameEnc && c.meta.members.slice().sort().join() === members.join());
     if (existing) return existing;
-    const id = 'g_' + U.rand(8);
-    const rawKey = C.randomRaw();
-    const keys = {};
-    for (const uid of members) {
-      const u = A.users.get(uid);
+    return makeGroup(members, '');
+  };
+
+  Y.normalizeGroupName = n => String(n || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+
+  /** Anyone can create a named group chat. The name is encrypted with the group key, like the messages. */
+  Y.createGroup = async function ({ name, userIds }) {
+    name = Y.normalizeGroupName(name);
+    if (name.length < 2) throw err('Group names need at least 2 characters.');
+    const others = U.uniq(userIds.filter(id => id !== me()));
+    if (!others.length) throw err('Pick at least one person.');
+    if (others.length + 1 > Y.MAX_GROUP) throw err(`Group chats can have up to ${Y.MAX_GROUP} people.`);
+    return makeGroup([me()].concat(others).sort(), name);
+  };
+
+  /** Wrap the group key for each of these people (from my ECDH key to theirs). */
+  async function wrapFor(id, rawKey, uids, keys, gen) {
+    for (const uid of uids) {
+      const u = A.users.get(uid) || await A.loadUser(uid);
+      if (!u || A.isRemoved(uid)) throw err('One of the people you picked is no longer in the workspace.');
       const wk = await C.pairKey(A.me.priv.ecdh, u.keys.ecdh, 'sankyo-wrap|' + id);
-      const enc = await C.encryptJSON(wk, { k: U.b64(rawKey) }, 'wrap|' + id + '|' + uid);
+      const enc = await C.encryptJSON(wk, { k: U.b64(rawKey) }, 'wrap|' + id + '|' + uid + (gen ? '|' + gen : ''));
       keys[uid] = { fp: u.ecdhFp, iv: enc.iv, ct: enc.ct };
     }
-    const meta = { v: 1, id, type: 'group', members, createdBy: me(), ts: Date.now(), keyFrom: A.me.ecdhFp, keys, kid: A.me.signFp };
+    return keys;
+  }
+
+  async function makeGroup(members, name) {
+    const id = 'g_' + U.rand(8);
+    const rawKey = C.randomRaw();
+    const keys = await wrapFor(id, rawKey, members, {});
+    const meta = { v: 1, id, type: 'group', members, createdBy: me(), ts: Date.now(), rev: 0, keyFrom: A.me.ecdhFp, keys, kid: A.me.signFp };
+    const aes = await C.importAes(rawKey);
+    if (name) meta.nameEnc = await C.encryptJSON(aes, { name }, 'name|' + id);
     meta.sig = await C.sign(A.me.priv.sign, meta);
     await S.writeJSON(`channels/${id}/meta.json`, meta);
-    const ch = addChan(newChan(id, meta));
+    const fresh = newChan(id, meta);
+    fresh.keyPs = new Map([[0, Promise.resolve(aes)]]);
+    if (name) fresh.groupName = name;
+    const ch = addChan(fresh);
     ch.days = []; ch.allLoaded = true;
     noteMyPost(id, meta.ts);
     return ch;
+  }
+
+  /** Decrypt a named group's name in the background, then refresh the sidebar. */
+  function loadGroupName(ch) {
+    if (!ch || ch.kind !== 'group' || !ch.meta.nameEnc) return;
+    const meta = ch.meta;
+    groupKey(ch).then(k => C.decryptJSON(k, meta.nameEnc, 'name|' + ch.id)).then(o => {
+      const n = Y.normalizeGroupName(o && o.name);
+      if (n && ch.meta === meta && n !== ch.groupName) { ch.groupName = n; Y.events.emit('channels'); Y.events.emit('group', ch); }
+    }).catch(e => console.warn('group name', ch.id, e));
+  }
+
+  Y.canManageGroup = ch => !!ch && ch.kind === 'group' && !!ch.meta && ch.meta.createdBy === me();
+
+  /**
+   * Creator only: rename the group, add people and/or remove people. meta.json is rewritten with a
+   * higher `rev` and re-signed; only the creator ever writes it, so there is still a single writer.
+   * People added get the current key, so they can read what is still in the group (7 days at most).
+   * Removing anyone rotates the key: a new generation is wrapped only for the people who stay, so the
+   * removed people can't read anything sent afterwards.
+   */
+  Y.updateGroup = async function (ch, { name, addIds, removeIds }) {
+    if (!Y.canManageGroup(ch)) throw err('Only the person who created this group can change it.');
+    if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
+    const old = ch.meta;
+    if (old.keyFrom !== A.me.ecdhFp) throw err('Your password was reset after you made this group, so it can’t be changed any more. Create a new group instead.');
+    const drop = U.uniq((removeIds || []).filter(id => old.members.includes(id) && id !== me()));
+    const add = U.uniq((addIds || []).filter(id => !old.members.includes(id)));
+    const members = old.members.filter(id => !drop.includes(id)).concat(add).sort();
+    if (members.length > Y.MAX_GROUP) throw err(`Group chats can have up to ${Y.MAX_GROUP} people.`);
+    if (members.length < 2) throw err('A group needs at least one other person.');
+    const now = Date.now();
+    const gen = curGen(ch);
+    const oldRaw = await groupRaw(ch, gen);
+    let nameText = null;
+    if (name !== undefined) {
+      nameText = Y.normalizeGroupName(name);
+      if (nameText.length < 2) throw err('Group names need at least 2 characters.');
+    } else if (old.nameEnc) {
+      nameText = (await C.decryptJSON(await C.importAes(oldRaw), old.nameEnc, 'name|' + ch.id)).name;
+    }
+    const meta = Object.assign({}, old, { members, rev: (old.rev || 0) + 1, updated: now, kid: A.me.signFp });
+    delete meta.sig;
+    const removed = Object.assign({}, old.removed);
+    drop.forEach(id => { removed[id] = now; });
+    add.forEach(id => { delete removed[id]; });
+    meta.removed = removed;
+    let rawKey = oldRaw;
+    if (drop.length) {
+      // new key generation; keep the old one (minus the removed people) so the rest can read history
+      const keep = (keys) => { const o = {}; for (const id of members) if (keys && keys[id]) o[id] = keys[id]; return o; };
+      const floor = now - Y.RETENTION - U.DAY_MS;
+      meta.past = (Array.isArray(old.past) ? old.past : []).filter(p => p && p.until > floor).map(p => Object.assign({}, p, { keys: keep(p.keys) }))
+        .concat([{ gen, keys: keep(old.keys), until: now }]);
+      meta.gen = gen + 1;
+      rawKey = C.randomRaw();
+      meta.keys = await wrapFor(ch.id, rawKey, members, {}, meta.gen);
+    } else {
+      // also re-wrap for existing members whose key changed (password reset), so they can read the group again
+      const stale = old.members.filter(id => { const u = A.users.get(id); return u && !A.isRemoved(id) && (!old.keys[id] || old.keys[id].fp !== u.ecdhFp); });
+      meta.keys = await wrapFor(ch.id, rawKey, add.concat(stale), Object.assign({}, old.keys), gen);
+    }
+    if (nameText) meta.nameEnc = await C.encryptJSON(await C.importAes(rawKey), { name: nameText }, 'name|' + ch.id);
+    meta.sig = await C.sign(A.me.priv.sign, meta);
+    await S.writeJSON(`channels/${ch.id}/meta.json`, meta);
+    applyGroupMeta(ch, meta);
+    noteMyPost(ch.id, now);
+    return ch;
   };
+
+  function applyGroupMeta(ch, meta) {
+    const was = (ch.meta.keys && ch.meta.keys[me()]) || {}, now = meta.keys[me()] || {};
+    if (was.fp !== now.fp || was.ct !== now.ct || curGen(ch) !== (meta.gen || 0)) ch.keyPs = null; // my key entry changed
+    ch.meta = meta;
+    if (!meta.nameEnc) ch.groupName = '';
+    loadGroupName(ch);
+    Y.events.emit('channels');
+    Y.events.emit('group', ch);
+  }
+
+  /** The creator removed me: drop the group from this PC (they may add me back later). */
+  function leftGroup(ch, ts) {
+    chans.delete(ch.id);
+    groupMiss.set(ch.id, ts || Date.now());
+    Y.events.emit('channels');
+    Y.events.emit('groupGone', ch);
+  }
+
+  /** Re-read a group's meta.json when it changed on disk; accept it only if the same creator signed a newer rev. */
+  async function refreshGroupMeta(ch, ts) {
+    if (ch.metaBusy) return;
+    ch.metaBusy = true;
+    try {
+      const r = await S.readJSONIfChanged(`channels/${ch.id}/meta.json`, ch.metaMtime);
+      if (r.unchanged || r.missing || !r.data) return;
+      ch.metaMtime = r.lastModified;
+      const m = r.data, old = ch.meta;
+      if (m.type !== 'group' || m.createdBy !== old.createdBy || !((m.rev || 0) > (old.rev || 0))) return;
+      if (!Array.isArray(m.members) || !m.keys) return;
+      if (!(await verifyMeta(m, ch.id))) return;
+      if (!m.members.includes(me()) || !m.keys[me()]) return leftGroup(ch, ts);
+      applyGroupMeta(ch, m);
+    } catch (e) { console.warn('group meta', ch.id, e); } finally { ch.metaBusy = false; }
+  }
 
   /* ================= discovery ================= */
 
@@ -578,9 +748,13 @@
       if (meta.type !== (kind === 'group' ? 'group' : 'public')) { notMine.add(id); return null; }
       // Only channels created (and signed) by an admin count; anything else on the share is ignored.
       if (kind === 'public' && !A.canActAt(meta.createdBy, meta.kid, meta.ts)) { notMine.add(id); return null; }
-      if (kind === 'group' && !(Array.isArray(meta.members) && meta.members.includes(me()) && meta.keys && meta.keys[me()])) { notMine.add(id); return null; }
+      // Not a member (yet): the creator may add us later, so re-check when the group shows newer activity.
+      if (kind === 'group' && !(Array.isArray(meta.members) && meta.members.includes(me()) && meta.keys && meta.keys[me()])) { if (!groupMiss.has(id)) groupMiss.set(id, 0); return null; }
+      groupMiss.delete(id);
       failed.delete(id);
-      return addChan(newChan(id, meta));
+      const ch = addChan(newChan(id, meta));
+      loadGroupName(ch);
+      return ch;
     })();
     discovering.set(id, p);
     try { return await p; } finally { discovering.delete(id); }
@@ -589,7 +763,7 @@
   async function rescanChannels() {
     failed.clear();
     const names = await S.list('channels', 'directory');
-    await U.mapLimit(names.filter(n => !chans.has(n) && !notMine.has(n)), 8, discover);
+    await U.mapLimit(names.filter(n => !chans.has(n) && !notMine.has(n) && !groupMiss.has(n)), 8, discover);
   }
 
   /* ================= presence & polling ================= */
@@ -643,8 +817,13 @@
     const ch = chans.get(id);
     if (!ch) {
       if (notMine.has(id) || failed.has(id)) return null;
+      if (groupMiss.has(id)) {
+        if (ts <= groupMiss.get(id)) return null;
+        groupMiss.set(id, ts);
+      }
       return discover(id).then(c => { if (c) noteActivity(id, ts); }).catch(handleErr);
     }
+    if (ch.kind === 'group' && ts > (ch.metaSeen || 0)) { ch.metaSeen = ts; refreshGroupMeta(ch, ts); }
     if (ts > ch.lastKnown && ts > ch.dirtyTo) ch.dirtyTo = ts;
     return null;
   }
@@ -809,7 +988,7 @@
     running = false;
     clearTimeout(timer);
     if (writeOffline && A.me) { try { await heartbeat('offline'); } catch { /* ignore */ } }
-    chans.clear(); Y.presence.clear(); notMine.clear(); failed.clear();
+    chans.clear(); Y.presence.clear(); notMine.clear(); failed.clear(); groupMiss.clear();
     Y.openId = null;
   };
 

@@ -63,6 +63,11 @@
     unsub = [
       Y.events.on('messages', ch => { if (ch.id === st.openId) schedule('msgs'); schedule('side'); }),
       Y.events.on('channels', () => schedule('side')),
+      Y.events.on('group', ch => { if (ch.id === st.openId) schedule('head', 'composer'); }),
+      Y.events.on('groupGone', ch => {
+        UI.toast(`You were removed from ${Y.info(ch).name}.`);
+        if (ch.id === st.openId) { UI.closeAll(); Chat.open(Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]); }
+      }),
       Y.events.on('presence', () => schedule('side', 'head')),
       Y.events.on('connection', () => schedule('side', 'banners')),
       Y.events.on('incoming', onIncoming),
@@ -126,7 +131,8 @@
     const focusKey = document.activeElement && el.side.contains(document.activeElement) ? document.activeElement.dataset.key : null;
     const all = Array.from(Y.chans.values());
     const pub = all.filter(c => c.kind === 'public' && !Y.info(c).archived).sort((a, b) => Y.info(a).name.localeCompare(Y.info(b).name));
-    const dms = all.filter(c => c.kind !== 'public').sort((a, b) => Y.info(a).name.localeCompare(Y.info(b).name));
+    const groups = all.filter(c => c.kind === 'group' && c.groupName).sort((a, b) => Y.info(a).name.localeCompare(Y.info(b).name));
+    const dms = all.filter(c => c.kind === 'dm' || (c.kind === 'group' && !c.groupName)).sort((a, b) => Y.info(a).name.localeCompare(Y.info(b).name));
     const me = A.users.get(meId());
     const myP = Y.presenceOf(meId());
 
@@ -141,7 +147,7 @@
       const badge = ch.unread && !active
         ? h('span', { class: 'badge' + (ch.mentions ? ' red' : '') }, String(ch.mentions || ch.unread))
         : null;
-      const label = (ch.kind === 'public' ? 'Channel ' : 'Conversation with ') + info.name + (ch.unread ? `, ${ch.unread} unread` : '');
+      const label = (ch.kind === 'public' ? 'Channel ' : ch.groupName ? 'Group chat ' : 'Conversation with ') + info.name + (ch.unread ? `, ${ch.unread} unread` : '');
       return h('button', {
         class: 'side-item' + (active ? ' active' : '') + (ch.unread && !active ? ' unread' : '') + (muted ? ' muted-ch' : ''),
         'data-open': ch.id, 'data-key': 'ch:' + ch.id, 'aria-current': active ? 'page' : null, 'aria-label': label,
@@ -156,6 +162,8 @@
       h('nav', { class: 'side-scroll' },
         h('div', { class: 'side-sec' }, h('span', null, 'Channels'), A.isAdmin() ? h('button', { class: 'icon-btn', 'data-act': 'new-channel', 'data-key': 'newch', 'aria-label': 'Create a channel', title: 'Create a channel' }, icon('plus')) : null),
         pub.map(item),
+        h('div', { class: 'side-sec' }, h('span', null, 'Group chats'), h('button', { class: 'icon-btn', 'data-act': 'new-group', 'data-key': 'newgrp', 'aria-label': 'Create a group chat', title: 'Create a group chat' }, icon('plus'))),
+        groups.length ? groups.map(item) : h('div', { class: 'side-empty' }, 'No group chats yet'),
         h('div', { class: 'side-sec' }, h('span', null, 'Direct messages'), h('button', { class: 'icon-btn', 'data-act': 'new-dm', 'data-key': 'newdm', 'aria-label': 'New direct message', title: 'New direct message' }, icon('plus'))),
         dms.length ? dms.map(item) : h('div', { class: 'side-empty' }, 'No conversations yet')),
       h('div', { class: 'side-tools' },
@@ -179,6 +187,7 @@
       case 'jump': return quickSwitcher();
       case 'new-channel': return A.isAdmin() ? newChannelDialog() : null;
       case 'new-dm': return newMessageDialog();
+      case 'new-group': return newGroupDialog();
       case 'feedback': return feedbackDialog();
       case 'inbox': return A.isOwner() ? inboxDialog() : null;
       case 'me-menu': return profileMenu(t);
@@ -300,7 +309,7 @@
     const mine = m.userId === meId();
     const shown = !m.deleted && !m.hidden && !m.decryptError && (m.verified || st.revealed.has(m.id));
     const mention = !mine && shown && (m.mentions.includes(meId()) || m.mentions.includes('channel'));
-    const cls = 'msg' + (grouped ? ' grouped' : '') + (mention ? ' mention' : '') + (m.local ? ' ' + m.status : '');
+    const cls = 'msg' + (mine ? ' mine' : ' theirs') + (grouped ? ' grouped' : '') + (mention ? ' mention' : '') + (m.local ? ' ' + m.status : '');
     const time = U.formatTime(m.ts);
     const main = h('div', { class: 'msg-main' });
     if (!grouped) {
@@ -802,7 +811,7 @@
     function row(it, i) {
       const content = it.kind === 'person'
         ? [UI.avatar(it.u, 32), h('div', null, h('div', null, it.u.name), h('div', { class: 'sub' }, UI.stateLabel(Y.presenceOf(it.u.id).state) + (Y.presenceOf(it.u.id).statusText ? ' · ' + Y.presenceOf(it.u.id).statusText : '')))]
-        : [h('span', { class: 'hash-big' }, it.c.kind === 'public' ? '#' : icon('users')), h('div', null, h('div', null, Y.info(it.c).name), h('div', { class: 'sub' }, it.c.unread ? `${it.c.unread} unread` : (Y.info(it.c).archived ? 'Archived' : (it.c.kind === 'group' ? 'Group message' : 'Channel'))))];
+        : [h('span', { class: 'hash-big' }, it.c.kind === 'public' ? '#' : icon('users')), h('div', null, h('div', null, Y.info(it.c).name), h('div', { class: 'sub' }, it.c.unread ? `${it.c.unread} unread` : (Y.info(it.c).archived ? 'Archived' : (it.c.kind === 'group' ? (it.c.groupName ? 'Group chat' : 'Group message') : 'Channel'))))];
       return h('button', { class: 's-item' + (i === sel ? ' sel' : ''), role: 'option', 'aria-selected': String(i === sel), onclick: () => { m.close(); it.go(); }, onmousemove: () => { if (sel !== i) { sel = i; compute(); } } }, content);
     }
     function draw(people, chans) {
@@ -871,7 +880,7 @@
 
   function newMessageDialog() {
     const ok = h('button', { class: 'btn btn-primary', disabled: true }, 'Start conversation');
-    const hint = h('div', { class: 'muted', style: { fontSize: '13px' } }, 'Pick one person, or up to 7 for a group message.');
+    const hint = h('div', { class: 'muted', style: { fontSize: '13px' } }, `Pick one person, or up to ${Y.MAX_GROUP - 1} for a group message.`);
     const pp = peoplePicker({ multi: true, max: Y.MAX_GROUP - 1, onChange: set => {
       ok.disabled = !set.size;
       ok.textContent = set.size > 1 ? `Start group (${set.size + 1} people)` : 'Start conversation';
@@ -880,6 +889,30 @@
     const m = UI.modal({ title: 'New direct message', cls: 'mid', body: [hint, pp.el,
       h('div', { class: 'note note-ok', style: { marginTop: '6px' } }, icon('lock'), h('div', null, 'End-to-end encrypted. Messages and files delete after 7 days.'))],
     foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+  }
+
+  function newGroupDialog() {
+    const err = h('div', { class: 'form-error hidden', role: 'alert' });
+    const name = h('input', { class: 'input', id: 'ng-name', maxlength: 60, placeholder: 'e.g. Warehouse team' });
+    const ok = h('button', { class: 'btn btn-primary', disabled: true }, 'Create group');
+    const count = h('div', { class: 'hint' }, `Pick up to ${Y.MAX_GROUP - 1} people.`);
+    let picked = new Set();
+    const update = () => {
+      ok.disabled = !picked.size || Y.normalizeGroupName(name.value).length < 2;
+      count.textContent = picked.size ? `${picked.size + 1} people including you (up to ${Y.MAX_GROUP}).` : `Pick up to ${Y.MAX_GROUP - 1} people.`;
+    };
+    const pp = peoplePicker({ multi: true, max: Y.MAX_GROUP - 1, onChange: set => { picked = set; update(); } });
+    name.addEventListener('input', update);
+    ok.addEventListener('click', () => UI.busy(ok, null, async () => {
+      const ch = await Y.createGroup({ name: name.value, userIds: Array.from(pp.picked) });
+      m.close(); Chat.open(ch.id);
+    }, err));
+    const m = UI.modal({ title: 'Create a group chat', cls: 'mid', body: [err,
+      h('div', { class: 'field' }, h('label', { for: 'ng-name' }, 'Group name'), name),
+      h('div', { class: 'field' }, h('span', { class: 'label' }, 'Members'), count), pp.el,
+      h('div', { class: 'note note-ok', style: { marginTop: '6px' } }, icon('lock'), h('div', null, 'End-to-end encrypted, including the group name. Only members can read it. Messages and files delete after 7 days.'))],
+    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+    name.focus();
   }
 
   function membersDialog(ch) {
@@ -949,10 +982,27 @@
       body.push(h('div', { class: 'row', style: { flexWrap: 'wrap' } }, actions));
     } else {
       const others = Y.members(ch).filter(id => id !== meId());
+      if (ch.kind === 'group') body.push(h('dl', { class: 'kv' },
+        ch.groupName ? [h('dt', null, 'Group name'), h('dd', null, ch.groupName)] : null,
+        h('dt', null, 'Created by'), h('dd', null, A.name(ch.meta.createdBy) + ' · ' + new Date(ch.meta.ts).toLocaleDateString()),
+        h('dt', null, 'Members'), h('dd', null, `${Y.members(ch).length} of ${Y.MAX_GROUP}`)));
+      if (Y.canManageGroup(ch)) body.push(h('div', { class: 'row', style: { flexWrap: 'wrap', marginBottom: '14px' } },
+        h('button', { class: 'btn', onclick: async () => {
+          const v = await UI.prompt({ title: 'Rename group', label: 'Group name', value: ch.groupName || '', maxlength: 60, onOk: val => Y.updateGroup(ch, { name: val }) });
+          if (v != null) { m.close(); UI.toast('Group renamed', 'ok'); }
+        } }, icon('edit'), ch.groupName ? 'Rename' : 'Give it a name'),
+        h('button', { class: 'btn', disabled: Y.members(ch).length >= Y.MAX_GROUP, title: Y.members(ch).length >= Y.MAX_GROUP ? `Groups can have up to ${Y.MAX_GROUP} people` : null,
+          onclick: () => { m.close(); addMembersDialog(ch); } }, icon('plus'), 'Add people')));
       body.push(h('div', { class: 'note note-ok', style: { marginTop: 0, marginBottom: '14px' } }, icon('lock'),
         h('div', null, h('b', null, 'End-to-end encrypted. '), 'Messages and files are encrypted on this PC before they reach the shared drive. Only the people here can read them, not even the admin. Everything is deleted 7 days after it was sent.')));
+      const canRemove = Y.canManageGroup(ch) && Y.members(ch).length > 2;
       body.push(h('div', { class: 'people-list' }, Y.members(ch).map(id => A.users.get(id)).filter(Boolean).map(u =>
-        h('div', { class: 'person' }, UI.avatar(u, 32), h('div', null, h('div', { class: 'nm' }, u.name + (u.id === meId() ? ' (you)' : '')), h('div', { class: 'sub' }, UI.stateLabel(Y.presenceOf(u.id).state)))))));
+        h('div', { class: 'person' }, UI.avatar(u, 32), h('div', null, h('div', { class: 'nm' }, u.name + (u.id === meId() ? ' (you)' : '')), h('div', { class: 'sub' }, u.id === ch.meta.createdBy ? 'Group creator' : UI.stateLabel(Y.presenceOf(u.id).state))),
+          canRemove && u.id !== meId() ? h('button', { class: 'btn btn-sm', style: { marginLeft: 'auto' }, 'aria-label': `Remove ${u.name} from the group`, onclick: async e => {
+            e.stopPropagation();
+            if (!(await UI.confirm({ title: `Remove ${u.name}?`, text: `${u.name} won’t see new messages in ${chName(ch)}. The group gets a new security key, so they can’t read anything sent from now on. Messages they already received stay on their PC until they expire.`, ok: 'Remove', danger: true }))) return;
+            try { await Y.updateGroup(ch, { removeIds: [u.id] }); m.close(); UI.toast(`Removed ${u.name}`, 'ok'); channelInfoDialog(ch); } catch (ex) { UI.toast(ex.message, 'error'); }
+          } }, 'Remove') : null))));
       if (ch.kind === 'dm' && A.users.get(others[0])) {
         const code = h('div', { class: 'fingerprint' }, '…');
         securityCode(others[0]).then(c => { code.textContent = c; });
@@ -962,6 +1012,25 @@
       body.push(h('div', { class: 'row' }, muteBtn));
     }
     const m = UI.modal({ title: ch.kind === 'public' ? '#' + info.name : info.name, cls: 'mid', body });
+  }
+
+  function addMembersDialog(ch) {
+    const room = Y.MAX_GROUP - Y.members(ch).length;
+    const err = h('div', { class: 'form-error hidden', role: 'alert' });
+    const ok = h('button', { class: 'btn btn-primary', disabled: true }, 'Add');
+    const pp = peoplePicker({ multi: true, max: room, exclude: Y.members(ch), onChange: set => {
+      ok.disabled = !set.size;
+      ok.textContent = set.size ? `Add ${set.size} ${set.size === 1 ? 'person' : 'people'}` : 'Add';
+    } });
+    ok.addEventListener('click', () => UI.busy(ok, null, async () => {
+      const n = pp.picked.size;
+      await Y.updateGroup(ch, { addIds: Array.from(pp.picked) });
+      m.close(); UI.toast(`Added ${n} ${n === 1 ? 'person' : 'people'}`, 'ok');
+    }, err));
+    const m = UI.modal({ title: `Add people to ${chName(ch)}`, cls: 'mid', body: [err,
+      h('div', { class: 'muted', style: { fontSize: '13px' } }, `You can add up to ${room} more ${room === 1 ? 'person' : 'people'}.`), pp.el,
+      h('div', { class: 'note note-info', style: { marginTop: '6px' } }, icon('lock'), h('div', null, 'People you add can read the messages still in this group (up to the last 7 days).'))],
+    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
   }
 
   async function exportChannel(ch) {
