@@ -12,7 +12,7 @@ A team chat app made of plain HTML, CSS and JavaScript. It runs with no internet
    - `data` folder: **Modify** for the staff group only.
 3. Turn on Previous Versions (shadow copies) for the share, or copy `data` daily. A copy of `data` is a full backup, and DMs stay encrypted in it.
 4. Give staff a desktop shortcut to `\\fileserver\Shared\SankyoChat\index.html`, set to open in Edge or Chrome.
-5. **Open the app yourself first.** The first person to connect an empty `data` folder creates the workspace and becomes the **super admin**. Remember your password: nobody can reset the super admin's password. Appoint admins later in ⚙ → Admin settings → People → **Make admin**.
+5. **Open the app yourself first.** The first person to connect an empty `data` folder creates the workspace and becomes the **super admin**. You'll also set a **security question**: if you forget your password, pick your name on the sign-in screen and click **Forgot password?** to choose a new one (your messages stay readable). Change the question any time in ⚙ → **Security question**. Treat the answer like a second password, because anyone with the data folder can try guesses. Without the question, nobody can reset the super admin's password. Appoint admins later in ⚙ → Admin settings → People → **Make admin**.
 6. Optional: in the app, open ⚙ → Admin settings → App files → **Check app files**, pick the `SankyoChat` folder, and click **Save as trusted fingerprint**. Later you can re-check whether anyone changed the code.
 
 When a PC has problems, open `check.html`. It tests the browser, folder access (it writes, reads and deletes a small file), encryption and notifications.
@@ -62,5 +62,5 @@ Copy the new files over the app folder and raise `APP_VERSION` in `js/version.js
 
 - Anyone with write access to `data` can delete files. Signatures expose altered messages but can't prevent deletion, so keep backups.
 - Anyone browsing the share can see who DMs whom and when (folder names and timestamps), file sizes, and channel messages.
-- If someone forgets their password, the admin resets it and they lose their DMs from before the reset (7 days at most). The admin account itself can't be reset.
+- If someone forgets their password, the admin resets it and they lose their DMs from before the reset (7 days at most). The super admin can't be reset by anyone, but can recover their own account with their security question.
 - Times come from each PC's clock. If clocks differ by a lot, messages can appear slightly out of order.

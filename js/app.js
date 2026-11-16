@@ -228,6 +228,16 @@
       onSubmit: async ({ userId, password, keep }) => { await A.signIn(userId, password, keep); await enterChat(); },
       onCreate: () => showCreateProfile(),
       onChangeFolder: async () => { await S.forgetHandle(); showConnect(); },
+      onRecover: async userId => {
+        const question = await A.recoveryQuestion(userId);
+        if (!question) throw new Error('No security question was set for this account, so the password can’t be recovered.');
+        const u = A.users.get(userId);
+        UI.screenRecover({
+          name: u ? u.name : '', question,
+          onSubmit: async ({ answer, pw, pw2 }) => { await A.recoverAccount(userId, answer, pw, pw2); UI.toast('Password changed', 'ok'); await enterChat(); },
+          onCancel: () => showSignIn(userId),
+        });
+      },
     });
     if (notice) UI.toast(notice);
   }

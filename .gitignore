@@ -2,6 +2,7 @@
 # Never commit it. Only the readme that explains the folder is tracked.
 data/*
 !data/README.txt
+data-backup-*/
 
 # Editor / OS clutter
 .vscode/

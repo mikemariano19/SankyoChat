@@ -258,10 +258,25 @@
     A.me = { id, priv, signFp: u.kid, ecdhFp: u.ecdhFp, mustChange: !!mustChange };
   }
 
-  async function writeNewUser(id, profile, password, keys, created) {
+  /* ---- security question (super admin only) ----
+   * The key file holds a second copy of the private keys, encrypted with the normalised answer.
+   * Anyone who can read the data folder can try guesses offline, so the answer must be hard to guess. */
+  A.MIN_ANSWER = 4;
+  const normAnswer = a => 'answer|' + String(a || '').normalize('NFC').trim().toLowerCase().replace(/\s+/g, ' ');
+  A.validateRecovery = function (question, answer) {
+    const q = String(question || '').trim();
+    if (q.length < 5 || q.length > 120) throw err('Write a security question (5–120 characters).');
+    if (normAnswer(answer).length - 7 < A.MIN_ANSWER) throw err(`The answer must be at least ${A.MIN_ANSWER} characters.`);
+    return q;
+  };
+  async function makeRecovery(privJwk, question, answer, id) {
+    return Object.assign({ question }, await C.wrapKeys(privJwk, normAnswer(answer), id));
+  }
+
+  async function writeNewUser(id, profile, password, keys, created, extra) {
     const privSign = (await C.importPrivate(keys.privJwk)).sign;
     const rec = await signedUser({ v: 1, id, name: profile.name, animal: profile.animal, color: profile.color, created, updated: created, keys: keys.pub, prev: [] }, privSign);
-    await S.writeJSON(`users/${id}.keys.json`, await C.wrapKeys(keys.privJwk, password, id));
+    await S.writeJSON(`users/${id}.keys.json`, await C.wrapKeys(keys.privJwk, password, id, extra));
     await S.writeJSON(`users/${id}.json`, rec);
     const u = await prepareUser(rec, id);
     A.users.set(id, u);
@@ -270,14 +285,15 @@
   }
 
   /** Brand-new share: create workspace.json, the admin profile and #general. */
-  A.createWorkspace = async function ({ wsName, name, animal, color, password, password2, keep }) {
+  A.createWorkspace = async function ({ wsName, name, animal, color, password, password2, question, answer, keep }) {
     wsName = String(wsName || '').trim() || 'Sankyo Chat';
     const profile = validateProfile({ name, animal, color });
     A.validatePassword(password, password2);
+    question = A.validateRecovery(question, answer);
     const keys = await C.generateUserKeys();
     const id = await newUserId();
     const now = Date.now();
-    await writeNewUser(id, profile, password, keys, now);
+    await writeNewUser(id, profile, password, keys, now, { recovery: await makeRecovery(keys.privJwk, question, answer, id) });
     const priv = await C.importPrivate(keys.privJwk);
     const kid = await C.fp(keys.pub.sign);
     const general = { v: 1, id: 'general', type: 'public', name: 'general', description: 'Company-wide news and questions', createdBy: id, ts: now, kid };
@@ -359,10 +375,47 @@
     const kf = await S.readJSON(`users/${id}.keys.json`);
     if (!kf) throw err('Key file missing.');
     const privJwk = await C.unwrapKeysJwk(kf, oldPw, id);
-    await S.writeJSON(`users/${id}.keys.json`, await C.wrapKeys(privJwk, newPw, id));
+    await S.writeJSON(`users/${id}.keys.json`, await C.wrapKeys(privJwk, newPw, id, kf.recovery ? { recovery: kf.recovery } : null));
     A.me.mustChange = false;
     const s = await U.idb.get('kv', 'session');
     if (s) { s.mustChange = false; await U.idb.set('kv', 'session', s); }
+  };
+
+  /** The security question for this profile, or null if it has none. */
+  A.recoveryQuestion = async function (id) {
+    const kf = await S.readJSON(`users/${id}.keys.json`);
+    return (kf && kf.recovery && kf.recovery.question) || null;
+  };
+
+  /** Forgot password: unlock the keys with the security answer and set a new password. Keeps all messages. */
+  A.recoverAccount = async function (id, answer, newPw, newPw2) {
+    A.validatePassword(newPw, newPw2);
+    const u = await A.loadUser(id);
+    if (!u) throw err('That profile could not be loaded.');
+    if (A.isRemoved(id)) throw err('This account was removed by the admin.');
+    const kf = await S.readJSON(`users/${id}.keys.json`);
+    if (!kf || !kf.recovery) throw err('This profile has no security question.');
+    let privJwk;
+    try { privJwk = await C.unwrapKeysJwk(kf.recovery, normAnswer(answer), id); } catch (e) {
+      if (e.code === 'BAD_PASSWORD') throw err('That answer isn’t right.');
+      throw e;
+    }
+    if (privJwk.sign.x !== u.keys.sign.x || privJwk.ecdh.x !== u.keys.ecdh.x) throw err('The security question belongs to old keys and can’t be used.');
+    await S.writeJSON(`users/${id}.keys.json`, await C.wrapKeys(privJwk, newPw, id, { recovery: kf.recovery }));
+    await setMe(id, privJwk, false);
+    await persistSession(false);
+  };
+
+  /** Super admin: set or change the security question. Needs the current password. */
+  A.setRecovery = async function (password, question, answer) {
+    if (!A.isOwner()) throw err('Only the super admin can set a security question.');
+    question = A.validateRecovery(question, answer);
+    const id = A.me.id;
+    const kf = await S.readJSON(`users/${id}.keys.json`);
+    if (!kf) throw err('Key file missing.');
+    const privJwk = await C.unwrapKeysJwk(kf, password, id);
+    kf.recovery = await makeRecovery(privJwk, question, answer, id);
+    await S.writeJSON(`users/${id}.keys.json`, kf);
   };
 
   A.updateProfile = async function ({ name, animal, color }) {

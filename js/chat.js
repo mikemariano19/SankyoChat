@@ -1170,6 +1170,7 @@
       }),
       h('div', { class: 'menu-sep' }),
       item('key', 'Change password', changePasswordDialog),
+      A.isOwner() ? item('key', 'Security question', recoveryDialog) : null,
       A.isAdmin() ? item('shield', 'Admin settings', adminDialog) : null,
       item('lock', 'Lock (sign out)', () => SC.app.lock()),
       h('div', { class: 'menu-foot' }, `Sankyo Chat ${SC.VERSION}` + (A.keepSignedIn() ? ' · kept signed in' : ` · locks after ${A.autoLockMinutes() || '—'} min idle`)),
@@ -1217,6 +1218,26 @@
       h('div', { class: 'field' }, h('label', { for: 'cp-pw' }, 'New password'), pw, UI.strengthMeter(pw)),
       h('div', { class: 'field' }, h('label', { for: 'cp-pw2' }, 'Confirm new password'), pw2),
       h('p', { class: 'muted', style: { fontSize: '13px' } }, 'Changing your password keeps your security keys, so your direct messages stay readable.')],
+    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+  }
+
+  async function recoveryDialog() {
+    const current = await A.recoveryQuestion(meId());
+    const err = h('div', { class: 'form-error hidden', role: 'alert' });
+    const cur = h('input', { class: 'input', type: 'password', id: 'rq-cur', autocomplete: 'current-password', autofocus: true });
+    const q = h('input', { class: 'input', id: 'rq-q', maxlength: 120, autocomplete: 'off', value: current || '' });
+    const a = h('input', { class: 'input', type: 'password', id: 'rq-a', autocomplete: 'off' });
+    const ok = h('button', { class: 'btn btn-primary' }, 'Save');
+    ok.addEventListener('click', () => UI.busy(ok, 'Saving…', async () => {
+      try { await A.setRecovery(cur.value, q.value, a.value); } catch (e) { if (e.code === 'BAD_PASSWORD') throw new Error('Your current password isn’t right.'); throw e; }
+      m.close(); UI.toast('Security question saved', 'ok');
+    }, err));
+    const m = UI.modal({ title: 'Security question', body: [err,
+      h('p', { class: 'muted', style: { fontSize: '13px' } }, current ? 'If you forget your password, answering this on the sign-in screen lets you choose a new one.' : 'No security question is set. Without one, a forgotten super admin password can’t be recovered.'),
+      h('div', { class: 'field' }, h('label', { for: 'rq-cur' }, 'Current password'), cur),
+      h('div', { class: 'field' }, h('label', { for: 'rq-q' }, 'Question'), q),
+      h('div', { class: 'field' }, h('label', { for: 'rq-a' }, current ? 'New answer' : 'Answer'), a,
+        h('div', { class: 'hint' }, `At least ${A.MIN_ANSWER} characters. Capitals and extra spaces don’t matter. Pick something staff couldn’t guess.`))],
     foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
   }
 

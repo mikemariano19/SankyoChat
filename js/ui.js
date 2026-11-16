@@ -403,6 +403,8 @@
     const name = h('input', { class: 'input', maxlength: 32, id: 'f-name', autocomplete: 'off', autofocus: true });
     const pw = h('input', { class: 'input', type: 'password', id: 'f-pw', autocomplete: 'new-password' });
     const pw2 = h('input', { class: 'input', type: 'password', id: 'f-pw2', autocomplete: 'new-password' });
+    const question = h('input', { class: 'input', id: 'f-q', maxlength: 120, autocomplete: 'off', placeholder: 'e.g. What was the name of my first manager?' });
+    const answer = h('input', { class: 'input', type: 'password', id: 'f-a', autocomplete: 'off' });
     const keep = h('input', { type: 'checkbox' });
     const pvAvatar = h('span');
     const pvName = h('span', { class: 'name' });
@@ -428,7 +430,7 @@
     const form = h('form', { onsubmit: e => {
       e.preventDefault();
       UI.busy(submit, 'Creating your security keys…', () => onSubmit({
-        wsName: wsName.value, name: name.value, animal: state.animal, color: state.color, password: pw.value, password2: pw2.value, keep: keep.checked,
+        wsName: wsName.value, name: name.value, animal: state.animal, color: state.color, password: pw.value, password2: pw2.value, question: question.value, answer: answer.value, keep: keep.checked,
       }), err);
     } },
       connected ? h('div', { class: 'note note-ok top' }, UI.icon('check'), h('div', null, 'Connected to ', b(connected))) : null,
@@ -442,7 +444,13 @@
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Background colour'), colors),
       h('div', { class: 'field' }, h('label', { for: 'f-pw' }, 'Password'), pw, strengthMeter(pw)),
       h('div', { class: 'field' }, h('label', { for: 'f-pw2' }, 'Confirm password'), pw2,
-        h('div', { class: 'hint' }, 'Your password protects your security keys. Nobody can recover it, not even the admin: they can only reset it, and your direct messages from before the reset can’t be opened.')),
+        h('div', { class: 'hint' }, withWorkspace
+          ? 'Your password protects your security keys. If you forget it, your security question below is the only way back in.'
+          : 'Your password protects your security keys. Nobody can recover it, not even the admin: they can only reset it, and your direct messages from before the reset can’t be opened.')),
+      withWorkspace ? h('div', { class: 'field' }, h('label', { for: 'f-q' }, 'Security question'), question,
+        h('div', { class: 'hint' }, 'Used only if you forget your password. Pick something staff couldn’t guess or look up.')) : null,
+      withWorkspace ? h('div', { class: 'field' }, h('label', { for: 'f-a' }, 'Answer'), answer,
+        h('div', { class: 'hint' }, `At least ${A.MIN_ANSWER} characters. Capitals and extra spaces don’t matter. Anyone with the answer can take over the super admin account, so treat it like a second password.`)) : null,
       h('div', { class: 'field' }, h('label', { class: 'check' }, keep, h('span', null, 'Keep me signed in on this PC', h('div', { class: 'hint' }, 'Only tick this on a PC nobody else uses.')))),
       submit,
       footer);
@@ -460,7 +468,7 @@
   };
 
   /** FR-04: pick your name, enter your password. */
-  UI.screenSignIn = function ({ wsName, users, preselect, onSubmit, onCreate, onChangeFolder }) {
+  UI.screenSignIn = function ({ wsName, users, preselect, onSubmit, onCreate, onChangeFolder, onRecover }) {
     let selected = users.find(u => u.id === preselect) ? preselect : (users.length === 1 ? users[0].id : null);
     const err = errBox();
     const pw = h('input', { class: 'input', type: 'password', id: 's-pw', autocomplete: 'current-password' });
@@ -476,6 +484,12 @@
     if (filter) filter.addEventListener('input', draw);
     draw();
     const submit = h('button', { class: 'btn btn-primary btn-lg', type: 'submit' }, 'Sign in');
+    const forgot = h('button', { class: 'link-btn', type: 'button', onclick: () => {
+      const showErr = t => { err.textContent = t; err.classList.remove('hidden'); };
+      if (!selected) return showErr('Pick your name first.');
+      if (!onRecover || !A.ws || selected !== A.ws.adminId) return showErr('Ask your admin to reset your password.');
+      UI.busy(forgot, null, () => onRecover(selected), err);
+    } }, 'Forgot password?');
     const form = h('form', { onsubmit: e => {
       e.preventDefault();
       if (!selected) { err.textContent = 'Pick your name first.'; err.classList.remove('hidden'); return; }
@@ -494,11 +508,31 @@
       h('div', { class: 'field' }, h('label', { for: 's-pw' }, 'Password'), pw),
       h('div', { class: 'field' }, h('label', { class: 'check' }, keep, h('span', null, 'Keep me signed in on this PC', h('div', { class: 'hint' }, 'Only on a PC nobody else uses. Otherwise the app locks after a while.')))),
       submit,
-      h('div', { class: 'card-foot' }, h('span', null, 'Forgot password? Ask your admin to reset it.'),
+      h('div', { class: 'card-foot' }, forgot,
         h('span', { class: 'row' }, h('button', { class: 'link-btn', type: 'button', onclick: onCreate }, 'New here? Create a profile'))),
       onChangeFolder ? h('div', { style: { textAlign: 'right', marginTop: '8px', fontSize: '13px' } }, h('button', { class: 'link-btn', type: 'button', onclick: onChangeFolder }, 'Use a different folder')) : null);
     UI.mount(screen(form));
     setTimeout(() => (selected ? pw : (filter || list.querySelector('button') || pw)).focus(), 0);
+  };
+
+  /** Super admin forgot their password: answer the security question, choose a new password. */
+  UI.screenRecover = function ({ name, question, onSubmit, onCancel }) {
+    const err = errBox();
+    const ans = h('input', { class: 'input', type: 'password', id: 'r-a', autocomplete: 'off', autofocus: true });
+    const pw = h('input', { class: 'input', type: 'password', id: 'r-pw', autocomplete: 'new-password' });
+    const pw2 = h('input', { class: 'input', type: 'password', id: 'r-pw2', autocomplete: 'new-password' });
+    const submit = h('button', { class: 'btn btn-primary btn-lg', type: 'submit' }, 'Reset password');
+    UI.mount(screen(h('form', { onsubmit: e => { e.preventDefault(); UI.busy(submit, 'Checking…', () => onSubmit({ answer: ans.value, pw: pw.value, pw2: pw2.value }), err); } },
+      brand('Forgot password', name),
+      h('p', { class: 'sub' }, 'Answer your security question to choose a new password. Your messages stay readable.'),
+      err,
+      h('div', { class: 'field' }, h('span', { class: 'label' }, 'Security question'), h('div', null, b(question))),
+      h('div', { class: 'field' }, h('label', { for: 'r-a' }, 'Answer'), ans),
+      h('div', { class: 'field' }, h('label', { for: 'r-pw' }, 'New password'), pw, strengthMeter(pw)),
+      h('div', { class: 'field' }, h('label', { for: 'r-pw2' }, 'Confirm new password'), pw2),
+      submit,
+      h('div', { class: 'card-foot' }, h('span'), h('button', { class: 'link-btn', type: 'button', onclick: onCancel }, 'Back to sign in')))));
+    setTimeout(() => ans.focus(), 0);
   };
 
   /** After an admin reset: choose a new password. */
