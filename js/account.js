@@ -38,7 +38,7 @@
   A.events = U.emitter();
   let wsMtime = 0;
   /** Workspace state after applying the signed admin action log (see recompute()). */
-  A.eff = { channels: {}, removed: new Set(), resets: {} };
+  A.eff = { channels: {}, removed: new Set(), resets: {}, teams: {} };
 
   const err = (msg, code) => Object.assign(new Error(msg), { code });
 
@@ -275,7 +275,7 @@
 
   async function writeNewUser(id, profile, password, keys, created, extra) {
     const privSign = (await C.importPrivate(keys.privJwk)).sign;
-    const rec = await signedUser({ v: 1, id, name: profile.name, animal: profile.animal, color: profile.color, created, updated: created, keys: keys.pub, prev: [] }, privSign);
+    const rec = await signedUser(Object.assign({ v: 1, id, name: profile.name, animal: profile.animal, color: profile.color, created, updated: created, keys: keys.pub, prev: [] }, profile.team ? { team: profile.team } : null), privSign);
     await S.writeJSON(`users/${id}.keys.json`, await C.wrapKeys(keys.privJwk, password, id, extra));
     await S.writeJSON(`users/${id}.json`, rec);
     const u = await prepareUser(rec, id);
@@ -285,9 +285,9 @@
   }
 
   /** Brand-new share: create workspace.json, the admin profile and #general. */
-  A.createWorkspace = async function ({ wsName, name, animal, color, password, password2, question, answer, keep }) {
+  A.createWorkspace = async function ({ wsName, name, animal, color, team, password, password2, question, answer, keep }) {
     wsName = String(wsName || '').trim() || 'Sankyo Chat';
-    const profile = validateProfile({ name, animal, color });
+    const profile = Object.assign(validateProfile({ name, animal, color }), { team: A.validateTeam(team) });
     A.validatePassword(password, password2);
     question = A.validateRecovery(question, answer);
     const keys = await C.generateUserKeys();
@@ -306,13 +306,14 @@
     U.ls.set('wsPin', { id: ws.id, kid });
     A.ws = ws; cacheWs(ws); recompute();
     await setMe(id, keys.privJwk, false);
+    await adminAction('team', id, { team: profile.team });
     await persistSession(!!keep);
   };
 
   /** Join an existing workspace. */
-  A.createProfile = async function ({ name, animal, color, password, password2, keep }) {
+  A.createProfile = async function ({ name, animal, color, team, password, password2, keep }) {
     await A.refreshUsers();
-    const profile = validateProfile({ name, animal, color });
+    const profile = Object.assign(validateProfile({ name, animal, color }), { team: A.validateTeam(team) });
     A.validatePassword(password, password2);
     const keys = await C.generateUserKeys();
     const id = await newUserId();
@@ -429,6 +430,86 @@
     A.events.emit('users');
   };
 
+  /* ---- groups (teams) ----
+   * Everyone belongs to one of two fixed groups (the two processes in the department). The list lives in
+   * workspace.json (`teams: [{id, name}]`, signed by the super admin, who can rename them); people are stored by
+   * the group's id, so a rename carries everyone with it. People choose a group when they create their profile
+   * (`team` in their own signed user record), but it only counts once an admin accepts or sets it: an admin
+   * action {type:'team', target, team}. Until then nothing limited to a group reaches them, so a wrong pick
+   * doesn't show them the other group's details. */
+  A.TEAM_DEFAULTS = [{ id: 't1', name: 'PICKUP GROUP' }, { id: 't2', name: 'INPUT GROUP' }];
+  A.normalizeTeam = t => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+  /** The two groups, in order: [{id, name}]. */
+  A.teamList = function () {
+    const ws = (A.ws && Array.isArray(A.ws.teams)) ? A.ws.teams : [];
+    return A.TEAM_DEFAULTS.map(d => {
+      const t = ws.find(x => x && x.id === d.id);
+      const name = t && A.normalizeTeam(t.name);
+      return { id: d.id, name: name || d.name };
+    });
+  };
+  /** A group id from an id or a name (any capitals); '' if it's neither. */
+  function resolveTeam(v) {
+    const s = A.normalizeTeam(v);
+    if (!s) return '';
+    const list = A.teamList();
+    const hit = list.find(t => t.id === s) || list.find(t => t.name.toLowerCase() === s.toLowerCase());
+    return hit ? hit.id : '';
+  }
+  A.teamName = id => { const t = A.teamList().find(x => x.id === id); return t ? t.name : ''; };
+  /** Accepted group id, or ''. */
+  A.teamOf = id => resolveTeam(A.eff.teams[id]);
+  /** The group id they asked for, while no admin has given them one yet ('' otherwise). Groups are permanent,
+   *  so once an admin has accepted or set a group the request is settled. */
+  A.teamRequest = id => {
+    if (A.teamOf(id)) return '';
+    const u = A.users.get(id);
+    return resolveTeam(u && u.team);
+  };
+  A.validateTeam = function (t) {
+    const id = resolveTeam(t);
+    if (!id) throw err('Choose your group.');
+    return id;
+  };
+  A.teamMembers = teamId => A.activeUsers().filter(u => A.teamOf(u.id) === teamId);
+  /** People waiting for an admin to accept their group. */
+  A.teamPending = () => A.activeUsers().filter(u => A.teamRequest(u.id));
+  /** I must choose a group before using the app (profiles made before groups existed). */
+  A.needsTeam = () => !!A.me && !A.teamOf(A.me.id) && !A.teamRequest(A.me.id);
+
+  /** Choose my group. It's permanent: staff choose once (if they don't have one yet), and after that only an
+   *  admin can change it. Admins' own choice is accepted at once. */
+  A.setMyTeam = async function (team) {
+    if (!A.isAdmin() && (A.teamOf(A.me.id) || A.teamRequest(A.me.id))) throw err('Your group is already set. Only an admin can change it.');
+    team = A.validateTeam(team);
+    const u = A.users.get(A.me.id);
+    if (u.team !== team) {
+      const rec = Object.assign({}, u, { team, updated: Date.now() });
+      ['_sign', '_ecdh', 'ecdhFp', 'sig'].forEach(k => delete rec[k]);
+      const signed = await signedUser(rec, A.me.priv.sign);
+      await S.writeJSON(`users/${u.id}.json`, signed);
+      A.users.set(u.id, await prepareUser(signed, u.id));
+    }
+    if (A.isAdmin() && A.teamOf(A.me.id) !== team) await adminAction('team', A.me.id, { team });
+    A.events.emit('users');
+  };
+  /** Admins: accept someone's requested group, or put them in the other one. */
+  A.assignTeam = async function (id, team) {
+    if (!A.isAdmin()) throw err('Only admins can do that');
+    team = A.validateTeam(team);
+    if (A.isRemoved(id)) throw err('That person was removed.');
+    await adminAction('team', id, { team });
+  };
+  /** Super admin: rename the two groups (everyone stays in their group). */
+  A.renameTeams = async function (names) {
+    if (!A.isOwner()) throw err('Only the super admin can rename groups.');
+    const teams = A.TEAM_DEFAULTS.map((d, i) => ({ id: d.id, name: A.normalizeTeam(names[i]) }));
+    if (teams.some(t => t.name.length < 2)) throw err('Each group needs a name of at least 2 characters.');
+    if (teams[0].name.toLowerCase() === teams[1].name.toLowerCase()) throw err('The two groups need different names.');
+    await A.saveWorkspace({ teams });
+    A.events.emit('workspace');
+  };
+
   /* ================= admin ================= */
 
   /* Moderation actions (channel changes, removals, password resets) are separate files in
@@ -446,7 +527,7 @@
 
   function recompute() {
     const ws = A.ws || {};
-    const eff = { channels: JSON.parse(JSON.stringify(ws.channels || {})), removed: new Set(ws.removed || []), resets: Object.assign({}, ws.resets) };
+    const eff = { channels: JSON.parse(JSON.stringify(ws.channels || {})), removed: new Set(ws.removed || []), resets: Object.assign({}, ws.resets), teams: {} };
     const actions = Array.from(A.adminLog.values()).sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : 1));
     for (const a of actions) {
       a.valid = A.canActAt(a.userId, a.kid, a.ts);
@@ -458,6 +539,9 @@
         if (typeof p.description === 'string') cur.description = p.description.slice(0, 250);
         if (typeof p.archived === 'boolean') cur.archived = p.archived;
         eff.channels[a.target] = cur;
+      } else if (a.type === 'team') {
+        const t = A.normalizeTeam(a.team); // a group id (older files may hold a name; resolved when read)
+        if (t) eff.teams[a.target] = t; else delete eff.teams[a.target];
       } else if (a.type === 'remove' || a.type === 'reset') {
         const byOwner = a.userId === ws.adminId;
         if (a.target === ws.adminId || (!byOwner && A.isUserAdmin(a.target))) { a.valid = false; continue; }
@@ -482,7 +566,7 @@
     await U.mapLimit(names, 8, async n => {
       const p = U.parseMsgName(n);
       const raw = await S.readJSON('admin/' + n);
-      if (!raw || raw.id !== p.id || raw.userId !== p.userId || raw.ts !== p.ts || !['channel', 'remove', 'reset'].includes(raw.type)) { badLog.add(n); return; }
+      if (!raw || raw.id !== p.id || raw.userId !== p.userId || raw.ts !== p.ts || !['channel', 'remove', 'reset', 'team'].includes(raw.type)) { badLog.add(n); return; }
       const key = await actorKey(raw.userId, raw.kid);
       if (!key || !(await C.verify(key, raw))) { badLog.add(n); return; }
       A.adminLog.set(n, raw);

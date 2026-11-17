@@ -51,6 +51,11 @@
     menu: '<path d="M3 12h18M3 6h18M3 18h18"/>',
     status: '<circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/>',
     volume: '<path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>',
+    pin: '<path d="M12 17v5M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>',
+    poll: '<path d="M3 3v18h18"/><path d="M8 16v-5M13 16V7M18 16v-3"/>',
+    zoomIn: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M11 8v6M8 11h6"/>',
+    zoomOut: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M8 11h6"/>',
+    fit: '<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/>',
   };
   /** @param {string} name */
   UI.icon = function (name, cls) {
@@ -406,6 +411,7 @@
     const question = h('input', { class: 'input', id: 'f-q', maxlength: 120, autocomplete: 'off', placeholder: 'e.g. What was the name of my first manager?' });
     const answer = h('input', { class: 'input', type: 'password', id: 'f-a', autocomplete: 'off' });
     const keep = h('input', { type: 'checkbox' });
+    const teamField = UI.teamInput('f-team');
     const pvAvatar = h('span');
     const pvName = h('span', { class: 'name' });
     const drawPreview = () => {
@@ -430,7 +436,7 @@
     const form = h('form', { onsubmit: e => {
       e.preventDefault();
       UI.busy(submit, 'Creating your security keys…', () => onSubmit({
-        wsName: wsName.value, name: name.value, animal: state.animal, color: state.color, password: pw.value, password2: pw2.value, question: question.value, answer: answer.value, keep: keep.checked,
+        wsName: wsName.value, name: name.value, animal: state.animal, color: state.color, team: teamField.input.value, password: pw.value, password2: pw2.value, question: question.value, answer: answer.value, keep: keep.checked,
       }), err);
     } },
       connected ? h('div', { class: 'note note-ok top' }, UI.icon('check'), h('div', null, 'Connected to ', b(connected))) : null,
@@ -440,6 +446,10 @@
       err,
       withWorkspace ? h('div', { class: 'field' }, h('label', { for: 'f-ws' }, 'Workspace name'), wsName) : null,
       h('div', { class: 'field' }, h('label', { for: 'f-name' }, 'Display name'), name, h('div', { class: 'hint' }, '2–32 characters. Must be unique in this workspace.')),
+      h('div', { class: 'field' }, h('span', { class: 'label' }, 'Group'), teamField.el,
+        h('div', { class: 'hint' }, withWorkspace
+          ? 'Required. As the super admin, yours is accepted straight away.'
+          : 'Required, and permanent: only an admin can change it later. An admin checks it before group-only messages reach you.')),
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Avatar'), animals),
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Background colour'), colors),
       h('div', { class: 'field' }, h('label', { for: 'f-pw' }, 'Password'), pw, strengthMeter(pw)),
@@ -457,6 +467,17 @@
     return form;
   }
 
+  /** The two groups as two big choices (no typing). `.input.value` is the chosen group's id ('' if none). */
+  UI.teamInput = function (id, value) {
+    let chosen = value || '';
+    const box = h('div', { class: 'team-pick', role: 'radiogroup', id, 'aria-label': 'Group' });
+    const draw = () => UI.set(box, A.teamList().map(t => h('button', {
+      type: 'button', role: 'radio', 'aria-checked': String(t.id === chosen), onclick: () => { chosen = t.id; draw(); },
+    }, h('span', { class: 'team-radio' }), h('b', null, t.name))));
+    draw();
+    return { input: { get value() { return chosen; } }, el: box };
+  };
+
   UI.screenCreateWorkspace = function ({ connected, onSubmit, onBack }) {
     UI.mount(screen(profileForm({ withWorkspace: true, submitLabel: 'Create workspace', connected, onSubmit,
       footer: h('div', { class: 'card-foot' }, h('span', null, 'Not the right folder?'), h('button', { class: 'link-btn', type: 'button', onclick: onBack }, 'Choose a different folder')) })));
@@ -468,6 +489,7 @@
   };
 
   /** FR-04: pick your name, enter your password. */
+  /** @returns {{setUsers: Function, alive: Function}} so the list can be refreshed while the screen is open */
   UI.screenSignIn = function ({ wsName, users, preselect, onSubmit, onCreate, onChangeFolder, onRecover }) {
     let selected = users.find(u => u.id === preselect) ? preselect : (users.length === 1 ? users[0].id : null);
     const err = errBox();
@@ -513,6 +535,18 @@
       onChangeFolder ? h('div', { style: { textAlign: 'right', marginTop: '8px', fontSize: '13px' } }, h('button', { class: 'link-btn', type: 'button', onclick: onChangeFolder }, 'Use a different folder')) : null);
     UI.mount(screen(form));
     setTimeout(() => (selected ? pw : (filter || list.querySelector('button') || pw)).focus(), 0);
+    return {
+      alive: () => document.contains(form),
+      setUsers(next) {
+        const sig = l => l.map(u => u.id + ':' + u.name + ':' + u.animal + ':' + u.color + ':' + A.roleLabel(u.id)).join('|');
+        if (sig(next) === sig(users)) return;
+        users = next;
+        if (selected && !users.some(u => u.id === selected)) selected = null;
+        const hadFocus = list.contains(document.activeElement);
+        draw();
+        if (hadFocus) { const b = list.querySelector('[aria-checked="true"]') || list.querySelector('button'); if (b) b.focus(); }
+      },
+    };
   };
 
   /** Super admin forgot their password: answer the security question, choose a new password. */

@@ -220,10 +220,25 @@
   }
   const h2btn = (label, fn, primary) => UI.h('button', { class: 'btn' + (primary ? ' btn-primary' : ''), onclick: fn }, label);
 
-  function showSignIn(preselect, notice) {
-    const users = A.activeUsers();
+  /** People who can still sign in: not removed, and their key file is still on the share
+   *  (removing someone deletes it, even if this PC hasn't picked up the removal itself yet). */
+  async function signInUsers() {
+    let withKeys = null;
+    try { withKeys = new Set((await S.list('users', 'file')).filter(n => /^[a-z0-9]{4}\.keys\.json$/.test(n)).map(n => n.slice(0, 4))); } catch (e) { console.warn(e); }
+    return A.activeUsers().filter(u => !withKeys || withKeys.has(u.id));
+  }
+  async function refreshForSignIn() {
+    for (const step of [A.refreshWorkspace, A.refreshUsers, A.refreshAdminLog]) { try { await step(); } catch (e) { console.warn(e); } }
+    return signInUsers();
+  }
+  let signInTimer = 0;
+
+  async function showSignIn(preselect, notice) {
+    clearInterval(signInTimer);
+    UI.screenLoading('Loading…');
+    const users = await refreshForSignIn();
     if (!users.length) return showCreateProfile();
-    UI.screenSignIn({
+    const screen = UI.screenSignIn({
       wsName: A.ws.name, users, preselect: preselect || U.ls.get('lastUser'),
       onSubmit: async ({ userId, password, keep }) => { await A.signIn(userId, password, keep); await enterChat(); },
       onCreate: () => showCreateProfile(),
@@ -240,6 +255,12 @@
       },
     });
     if (notice) UI.toast(notice);
+    // keep the list current while the screen is open (people removed or added on other PCs)
+    signInTimer = setInterval(async () => {
+      if (!screen.alive() || A.me) { clearInterval(signInTimer); return; }
+      const next = await refreshForSignIn();
+      if (screen.alive()) screen.setUsers(next);
+    }, 20000);
   }
 
   function showCreateProfile() {
