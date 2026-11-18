@@ -37,7 +37,7 @@
   const groupMiss = new Map(); // group id → newest activity ts when we last found we weren't a member (re-checked on newer activity)
   const discovering = new Map();
   let readMap = {};
-  let mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {} };
+  let mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {} };
   let running = false;
   let timer = 0;
 
@@ -357,6 +357,7 @@
     const added = [];
     for (const m of items) if (apply(ch, m)) added.push(m);
     bump(ch, opts.quiet);
+    if (added.length && chans.get(ch.id) === ch) Y.events.emit('loaded', { ch, msgs: added });
     if (!opts.quiet) {
       const incoming = added.filter(m => m.ts > Y.startedAt && m.userId !== me());
       if (incoming.length && chans.get(ch.id) === ch) Y.events.emit('incoming', { ch, msgs: incoming });
@@ -495,6 +496,7 @@
     mine.lastPost[id] = Math.max(mine.lastPost[id] || 0, ts);
     heartbeat();
   }
+  Y.noteMyPost = noteMyPost;
 
   let lastWriteTs = 0;
   async function writeItem(ch, type, payload) {
@@ -734,17 +736,17 @@
   Y.normalizeGroupName = n => String(n || '').replace(/\s+/g, ' ').trim().slice(0, 60);
 
   /** Anyone can create a named group chat. The name is encrypted with the group key, like the messages. */
-  Y.createGroup = async function ({ name, userIds }) {
+  Y.createGroup = async function ({ name, userIds, listed }) {
     name = Y.normalizeGroupName(name);
     if (name.length < 2) throw err('Group names need at least 2 characters.');
     const others = U.uniq(userIds.filter(id => id !== me()));
     if (!others.length) throw err('Pick at least one person.');
     if (others.length + 1 > Y.MAX_GROUP) throw err(`Group chats can have up to ${Y.MAX_GROUP} people.`);
-    return makeGroup([me()].concat(others).sort(), name);
+    return makeGroup([me()].concat(others).sort(), name, { listed: !!listed });
   };
 
   /** Admins: an encrypted, invite-only channel. `replaces` = id of a public channel being made private (its name may be reused). */
-  Y.createPrivateChannel = async function ({ name, description, userIds, replaces }) {
+  Y.createPrivateChannel = async function ({ name, description, userIds, replaces, listed }) {
     if (!A.isAdmin()) throw err('Only admins can create private channels.');
     name = Y.normalizeChannelName(name);
     if (name.length < 2) throw err('Channel names need at least 2 letters or numbers.');
@@ -753,7 +755,7 @@
     const others = U.uniq((userIds || []).filter(id => id !== me()));
     if (!others.length) throw err('Invite at least one person.');
     if (others.length + 1 > Y.MAX_GROUP) throw err(`Private channels can have up to ${Y.MAX_GROUP} people.`);
-    return makeGroup([me()].concat(others).sort(), name, { channel: true, description: String(description || '').trim().slice(0, 250) });
+    return makeGroup([me()].concat(others).sort(), name, { channel: true, description: String(description || '').trim().slice(0, 250), listed: !!listed, replaces });
   };
 
   /** Wrap the group key for each of these people (from my ECDH key to theirs; `by`/`from` say whose). */
@@ -774,6 +776,7 @@
     const keys = await wrapFor(id, rawKey, members, {});
     const meta = { v: 1, id, type: 'group', members, createdBy: me(), by: me(), ts: Date.now(), rev: 0, keyFrom: A.me.ecdhFp, keys, kid: A.me.signFp };
     if (opts.channel) meta.channel = true;
+    if (opts.listed && name) meta.listed = true;
     const aes = await C.importAes(rawKey);
     if (name) meta.nameEnc = await C.encryptJSON(aes, opts.description ? { name, description: opts.description } : { name }, 'name|' + id);
     meta.sig = await C.sign(A.me.priv.sign, meta);
@@ -785,8 +788,29 @@
     const ch = addChan(fresh);
     ch.days = []; ch.allLoaded = true;
     noteMyPost(id, meta.ts);
+    if (meta.listed) await syncDirectory(ch).catch(e => console.warn('directory', e));
+    // admins' named groups and private channels are reported to the super admin (the name is sealed for them only)
+    if (name && A.isAdmin() && !A.isOwner()) {
+      const kind = opts.replaces ? 'private-channel.make-private' : opts.channel ? 'private-channel.create' : 'group.create';
+      await A.audit(kind, id, members.length, { name }).catch(e => console.warn('audit', e));
+    }
     return ch;
   }
+
+  /* ---- group directory ("Browse groups") ----
+   * A group chat or private channel whose creator ticks "Let people find and request to join" gets meta.listed = true
+   * and a plain, signed directory/<groupId>.json holding only its name, description and member count. Its messages
+   * stay encrypted. Turning it off deletes the file. */
+  async function syncDirectory(ch) {
+    if (!Y.canManageGroup(ch)) return;
+    const path = `directory/${ch.id}.json`;
+    if (!ch.meta.listed || !ch.groupName) { await S.remove(path); return; }
+    const entry = { v: 1, id: ch.id, name: ch.groupName, description: ch.groupDesc || '', count: Y.members(ch).length,
+      channel: !!ch.meta.channel, createdBy: ch.meta.createdBy, by: me(), ts: Date.now(), kid: A.me.signFp };
+    entry.sig = await C.sign(A.me.priv.sign, entry);
+    await S.writeJSON(path, entry);
+  }
+  Y.syncDirectory = syncDirectory;
 
   /** Decrypt a named group's name in the background, then refresh the sidebar. */
   function loadGroupName(ch) {
@@ -830,7 +854,7 @@
    * People added get the current key, so they can read what is still in the group (7 days at most).
    * Removing anyone rotates the key: a new generation is wrapped only for the people who stay.
    */
-  Y.updateGroup = async function (ch, { name, addIds, removeIds, admins }) {
+  Y.updateGroup = async function (ch, { name, addIds, removeIds, admins, listed }) {
     if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
     await refreshGroupMeta(ch, 0, true); // build on the newest version another admin may have written
     if (!chans.has(ch.id)) throw err('You’re no longer in this group.');
@@ -863,6 +887,7 @@
     }
     const meta = Object.assign({}, old, { members, rev: (old.rev || 0) + 1, updated: now, by: me(), kid: A.me.signFp });
     delete meta.sig;
+    if (listed !== undefined) { if (listed && nameText) meta.listed = true; else delete meta.listed; }
     const removed = Object.assign({}, old.removed);
     drop.forEach(id => { removed[id] = now; });
     add.forEach(id => { delete removed[id]; });
@@ -906,6 +931,10 @@
     await S.writeJSON(`channels/${ch.id}/meta.json`, meta);
     applyGroupMeta(ch, meta);
     noteMyPost(ch.id, now);
+    if (meta.listed || old.listed) {
+      if (nameText) { ch.groupName = nameText; ch.groupDesc = descText; }
+      await syncDirectory(ch).catch(e => console.warn('directory', e));
+    }
     return ch;
   };
 
@@ -938,7 +967,7 @@
         let raw = null;
         try { raw = JSON.parse(await f.text()); } catch { /* ignore */ }
         const ts = await parseLeave(ch.id, uid, raw);
-        if (ts && ts !== leaves[uid]) { leaves[uid] = ts; changed = true; }
+        if (ts && ts !== leaves[uid]) { leaves[uid] = ts; changed = true; Y.events.emit('groupLeave', { ch, uid, ts }); }
       }
       if (changed) { ch.leaves = leaves; Y.events.emit('channels'); Y.events.emit('group', ch); }
       if (Y.canManageGroup(ch) && Y.connected) {
@@ -968,7 +997,8 @@
   };
 
   /** I was removed: drop the group from this PC (I may be added back later). */
-  function leftGroup(ch, ts) {
+  function leftGroup(ch, ts, newMeta) {
+    ch.goneMeta = newMeta || null;
     chans.delete(ch.id);
     groupMiss.set(ch.id, ts || Date.now());
     Y.events.emit('channels');
@@ -990,13 +1020,16 @@
       if (((m.admins && m.admins.arev) || 0) < ((old.admins && old.admins.arev) || 0)) return;
       if (!Array.isArray(m.members) || !m.keys) return;
       if (!(await verifyMeta(m, ch.id))) return;
-      if (!m.members.includes(me()) || !m.keys[me()]) return leftGroup(ch, ts);
+      if (!m.members.includes(me()) || !m.keys[me()]) return leftGroup(ch, ts, m);
       applyGroupMeta(ch, m);
     } catch (e) { console.warn('group meta', ch.id, e); } finally { ch.metaBusy = null; done(); }
   }
 
   /* ================= discovery ================= */
 
+  Y.verifyMeta = (meta, id) => verifyMeta(meta, id);
+  Y.groupKey = (ch, gen) => groupKey(ch, gen);
+  Y.curGen = ch => curGen(ch);
   async function verifyMeta(meta, id) {
     if (!meta || meta.id !== id) return false;
     let signer = meta.createdBy;
@@ -1073,12 +1106,14 @@
       if (cur && cur.userId === uid) {
         for (const [k, v] of Object.entries(cur.lastPost || {})) if (typeof v === 'number' && !(mine.lastPost[k] >= v)) mine.lastPost[k] = v;
         for (const [k, v] of Object.entries(cur.acks || {})) if (typeof v === 'number' && !(mine.acks[k] >= v)) mine.acks[k] = v;
+        mergeNotif(cur);
         if ((cur.statusTs || 0) > mine.statusTs) { mine.statusText = cur.statusText || ''; mine.statusTs = cur.statusTs; }
       }
       const cutoff = Date.now() - 14 * U.DAY_MS;
       for (const k of Object.keys(mine.lastPost)) if (mine.lastPost[k] < cutoff) delete mine.lastPost[k];
+      for (const k of Object.keys(mine.notifSeen)) if (!(mine.notifSeen[k] >= Date.now() - 30 * U.DAY_MS)) delete mine.notifSeen[k];
       for (const k of Object.keys(mine.acks)) { const pn = U.parseMsgName(k + '.json'); if (!pn || pn.ts < Date.now() - Y.ANN_DAYS * U.DAY_MS) delete mine.acks[k]; }
-      const data = { v: 1, userId: uid, lastSeen: Date.now(), status: status || Y.myStatus(), statusText: mine.statusText, statusTs: mine.statusTs, lastPost: mine.lastPost, seen: mySeen(), acks: mine.acks };
+      const data = { v: 1, userId: uid, lastSeen: Date.now(), status: status || Y.myStatus(), statusText: mine.statusText, statusTs: mine.statusTs, lastPost: mine.lastPost, seen: mySeen(), acks: mine.acks, notifRead: mine.notifRead, notifSeen: mine.notifSeen };
       await S.writeJSON(`presence/${uid}.json`, data);
       Y.presence.set(uid, { data, mtime: 0 });
     } catch (e) { handleErr(e); } finally {
@@ -1087,6 +1122,25 @@
     }
   }
   Y.heartbeat = heartbeat;
+
+  /* ---- notification read-state ----
+   * Kept in my presence file so it follows me to other PCs: notifRead = everything up to this time is read,
+   * notifSeen = {notificationId: ts} for single items opened before that. */
+  function mergeNotif(cur) {
+    if (typeof cur.notifRead === 'number' && cur.notifRead > mine.notifRead) mine.notifRead = cur.notifRead;
+    if (cur.notifSeen && typeof cur.notifSeen === 'object') {
+      for (const [k, v] of Object.entries(cur.notifSeen)) if (typeof v === 'number' && !(mine.notifSeen[k] >= v)) mine.notifSeen[k] = v;
+    }
+  }
+  Y.notifRead = () => mine.notifRead;
+  Y.notifSeen = id => !!mine.notifSeen[id];
+  Y.markNotifs = function (upTo, ids) {
+    let changed = false;
+    if (upTo && upTo > mine.notifRead) { mine.notifRead = upTo; changed = true; }
+    for (const id of ids || []) if (!mine.notifSeen[id]) { mine.notifSeen[id] = Date.now(); changed = true; }
+    if (changed) heartbeat();
+    return changed;
+  };
 
   /** @returns {{state:'online'|'away'|'offline', statusText:string, lastSeen?:number}} */
   Y.presenceOf = function (uid) {
@@ -1136,6 +1190,7 @@
         if (typeof ts !== 'number') continue;
         // an admin posted or withdrew an announcement: pick it up now instead of on the 30-second check
         if (cid === ANN_KEY) { if (ts > annHint) { annHint = ts; found.push(Y.refreshAnnouncements().catch(handleErr)); } continue; }
+        if (cid.includes(':')) continue; // request and audit hints, read by js/notify.js
         found.push(noteActivity(cid, ts));
       }
     }
@@ -1271,7 +1326,7 @@
     Y.startedAt = Date.now();
     Y.connected = true;
     readMap = U.ls.get(readKeyName(), {});
-    mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {} };
+    mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {} };
     Y.announcements.clear(); badAnn.clear(); annHint = 0;
     const cur = await S.readJSON(`presence/${me()}.json`);
     if (cur && cur.userId === me()) {
@@ -1279,6 +1334,7 @@
       mine.statusText = cur.statusText || '';
       mine.statusTs = cur.statusTs || 0;
       for (const [k, v] of Object.entries(cur.acks || {})) if (typeof v === 'number') mine.acks[k] = v;
+      mergeNotif(cur);
     }
     try { await A.refreshAdminLog(); } catch (e) { console.warn(e); }
     try { await Y.refreshAnnouncements(); } catch (e) { console.warn(e); }
@@ -1286,6 +1342,7 @@
     await heartbeat();
     await pollPresence();
     await processDirty();
+    Y.events.emit('started');
     const now = Date.now();
     tasks.forEach(t => { t.last = t.first ? now - t.every + t.first : now; t.busy = false; });
     tick();
@@ -1343,13 +1400,71 @@
         try { ({ title, text } = await openPrivateAnnouncement(raw)); } catch (e) { console.warn('announcement', id, e); badAnn.add(id); continue; }
         to = raw.to.filter(x => typeof x === 'string');
       }
-      Y.announcements.set(id, { id, userId: raw.userId, ts: raw.ts, title: String(title || '').slice(0, 120), text: String(text || '').slice(0, Y.MAX_TEXT), to });
+      const team = to && typeof raw.team === 'string' && /^td$/.test(raw.team) ? raw.team : null;
+      Y.announcements.set(id, { id, userId: raw.userId, ts: raw.ts, title: String(title || '').slice(0, 120), text: String(text || '').slice(0, Y.MAX_TEXT), to, team, kid: raw.kid });
       changed = true;
     }
     for (const [id, a] of Y.announcements) if (a.ts < floor) { Y.announcements.delete(id); changed = true; }
+    if (await readAnnouncementEdits()) changed = true;
     if (changed) Y.events.emit('announcements');
     return changed;
   }
+
+  /* ---- editing announcements ----
+   * The author can fix a mistake: announcements/edits/<announcementId>.json holds the newest {title, text},
+   * signed by the author (only they write it). For a private announcement it's encrypted with the same key
+   * as the announcement, so the same people can read it. Acknowledgements stay, so it doesn't pop up again. */
+  const annKeys = new Map();     // private announcement id → its AES key
+  const editMtimes = new Map();  // announcement id → lastModified of its edit file
+  async function readAnnouncementEdits() {
+    const names = (await S.list('announcements/edits', 'file')).filter(n => U.MSG_RE.test(n) && !n.includes('.ev.'));
+    let changed = false;
+    for (const n of names) {
+      const id = n.slice(0, -5);
+      const a = Y.announcements.get(id);
+      if (!a) continue;
+      const r = await S.readJSONIfChanged('announcements/edits/' + n, editMtimes.get(id));
+      if (r.unchanged || r.missing || !r.data) continue;
+      editMtimes.set(id, r.lastModified);
+      const raw = r.data;
+      if (raw.type !== 'ann-edit' || raw.target !== id || raw.userId !== a.userId || typeof raw.ts !== 'number' || raw.ts <= (a.editTs || 0)) continue;
+      if (!(await verifyRaw(raw)) || !A.canActAt(raw.userId, raw.kid, raw.ts)) continue;
+      let title = raw.title, text = raw.text;
+      if (a.to) {
+        const k = annKeys.get(id);
+        if (!k) continue;
+        try { ({ title, text } = await C.decryptJSON(k, raw.enc, 'annedit|' + id + '|' + raw.ts)); } catch { continue; }
+      }
+      if (typeof text !== 'string' || !text.trim()) continue;
+      Object.assign(a, { title: String(title || '').slice(0, 120), text: text.slice(0, Y.MAX_TEXT), editTs: raw.ts });
+      changed = true;
+    }
+    return changed;
+  }
+
+  Y.canEditAnnouncement = a => !!a && !!A.me && a.userId === me() && A.isAdmin();
+  Y.editAnnouncement = async function (id, { title, text }) {
+    const a = Y.announcements.get(id);
+    if (!Y.canEditAnnouncement(a)) throw err('Only the admin who posted it can edit it.');
+    if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
+    title = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    text = String(text || '').trim();
+    if (!text) throw err('Write the announcement first.');
+    if (text.length > Y.MAX_TEXT) throw err(`Announcements can be up to ${Y.MAX_TEXT} characters.`);
+    const ts = Math.max(Date.now(), (a.editTs || 0) + 1);
+    const raw = { v: 1, type: 'ann-edit', target: id, userId: me(), ts, kid: A.me.signFp, title: '', text: '' };
+    if (a.to) {
+      const k = annKeys.get(id);
+      if (!k) throw err('This announcement can’t be edited from this PC.');
+      raw.enc = await C.encryptJSON(k, { title, text }, 'annedit|' + id + '|' + ts);
+    } else { raw.title = title; raw.text = text; }
+    raw.sig = await C.sign(A.me.priv.sign, raw);
+    await S.writeJSON(`announcements/edits/${id}.json`, raw);
+    Object.assign(a, { title, text, editTs: ts });
+    annHint = Math.max(annHint, ts);
+    noteMyPost(ANN_KEY, ts);
+    Y.events.emit('announcements');
+  };
 
   /* Private announcements: {title, text} are encrypted with a random key, wrapped for each recipient
    * (ECDH from the author's key to theirs). raw.to lists the recipients (user ids, readable on the share). */
@@ -1362,8 +1477,22 @@
     if (!theirs) throw err('Unknown author key', 'OLD_KEY');
     const wk = await C.pairKey(A.me.priv.ecdh, theirs, annWrapInfo(raw.id));
     const { k } = await C.decryptJSON(wk, entry, 'annwrap|' + raw.id + '|' + me());
-    return C.decryptJSON(await C.importAes(U.unb64(k)), raw.enc, 'ann|' + raw.id);
+    const aes = await C.importAes(U.unb64(k));
+    annKeys.set(raw.id, aes);
+    return C.decryptJSON(aes, raw.enc, 'ann|' + raw.id);
   }
+
+  /** The one group every recipient (except the author) is in, or null. */
+  function recipientTeam(to, author) {
+    const teams = U.uniq(to.filter(x => x !== author).map(x => A.teamOf(x) || ''));
+    return teams.length === 1 && teams[0] ? teams[0] : null;
+  }
+  /** Which Announcements feed it belongs in: a group id for a private one sent to one group, '' for the main feed.
+   *  Older private ones (before the tag) are placed by their recipients' current group. */
+  Y.annFeedOf = function (a) {
+    if (!a || !a.to) return '';
+    return a.team || recipientTeam(a.to, a.userId) || '';
+  };
 
   /** Newest first. */
   Y.announcementList = () => Array.from(Y.announcements.values()).sort((a, b) => b.ts - a.ts);
@@ -1390,8 +1519,19 @@
   };
 
   /** `to`: user ids for a private announcement (only they can read it); omit for everyone. */
-  Y.postAnnouncement = async function ({ title, text, to }) {
+  /** Private announcements: an admin may only send them to people in their own group (the super admin to anyone).
+   *  @returns {string|null} the group id they're limited to, '' if they have no group yet, null for no limit */
+  Y.announceTeam = () => (A.isOwner() ? null : (A.teamOf(me()) || ''));
+  Y.canAnnounceTo = id => { const t = Y.announceTeam(); return t === null || (!!t && A.teamOf(id) === t); };
+
+  Y.postAnnouncement = async function ({ title, text, to, label }) {
     if (!A.isAdmin()) throw err('Only admins can post announcements.');
+    if (Array.isArray(to)) {
+      const t = Y.announceTeam();
+      if (t === '') throw err('You need an accepted group before you can send private announcements.');
+      const outside = to.filter(x => x !== me() && !Y.canAnnounceTo(x));
+      if (outside.length) throw err(`You can only send private announcements to people in ${A.teamName(t)}. Remove ${outside.map(A.name).join(', ')}.`);
+    }
     if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
     title = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
     text = String(text || '').trim();
@@ -1408,6 +1548,8 @@
       const key = C.randomRaw();
       raw.title = ''; raw.text = '';
       raw.to = recipients; raw.from = A.me.ecdhFp; raw.keys = {};
+      const team = recipientTeam(recipients, me());
+      if (team) raw.team = team; // shown in that group's Announcements feed
       for (const uid of recipients) {
         const u = A.users.get(uid) || await A.loadUser(uid);
         if (!u) continue;
@@ -1415,14 +1557,18 @@
         const e = await C.encryptJSON(wk, { k: U.b64(key) }, 'annwrap|' + id + '|' + uid);
         raw.keys[uid] = { fp: u.ecdhFp, iv: e.iv, ct: e.ct };
       }
-      raw.enc = await C.encryptJSON(await C.importAes(key), { title, text }, 'ann|' + id);
+      const aes = await C.importAes(key);
+      annKeys.set(id, aes);
+      raw.enc = await C.encryptJSON(aes, { title, text }, 'ann|' + id);
     }
     raw.sig = await C.sign(A.me.priv.sign, raw);
     await S.writeJSON(`announcements/${id}.json`, raw);
-    Y.announcements.set(id, { id, userId: me(), ts, title, text, to: recipients });
+    Y.announcements.set(id, { id, userId: me(), ts, title, text, to: recipients, team: raw.team || null });
     annHint = Math.max(annHint, ts);
     noteMyPost(ANN_KEY, ts);
     Y.events.emit('announcements');
+    // a private announcement by an admin is reported to the super admin: title and recipient count only
+    if (recipients && !A.isOwner()) await A.audit('announcement.private', id, recipients.length - 1, { title, label: String(label || '').slice(0, 80) }).catch(e => console.warn('audit', e));
     return id;
   };
 
@@ -1431,6 +1577,7 @@
     if (!a) return;
     if (!A.isAdmin()) throw err('Only admins can withdraw announcements.');
     await S.remove(`announcements/${id}.json`);
+    await S.remove(`announcements/edits/${id}.json`).catch(() => {});
     Y.announcements.delete(id);
     const ts = Date.now();
     annHint = Math.max(annHint, ts);

@@ -7,7 +7,7 @@
   const App = {};
 
   SC.APP_FILES = ['index.html', 'check.html', 'css/app.css', 'js/version.js', 'js/util.js', 'js/store.js', 'js/crypto.js',
-    'js/account.js', 'js/sync.js', 'js/emoji.js', 'js/ui.js', 'js/chat.js', 'js/app.js', 'js/check.js'];
+    'js/account.js', 'js/sync.js', 'js/notify.js', 'js/emoji.js', 'js/ui.js', 'js/chat.js', 'js/app.js', 'js/check.js'];
 
   const dataPath = () => U.dataPathFromLocation(location.href);
   const connectedLabel = () => {
@@ -59,6 +59,7 @@
   }
   let lastChime = 0;
   App.notify = function ({ title, body, tag, onClick }) {
+    if (SC.notify && SC.notify.isQuiet()) return; // Do Not Disturb
     if (Date.now() - lastChime > 1500) { chime(); lastChime = Date.now(); }
     if (App.notificationState() !== 'granted') return;
     try {
@@ -245,7 +246,7 @@
       onChangeFolder: async () => { await S.forgetHandle(); showConnect(); },
       onRecover: async userId => {
         const question = await A.recoveryQuestion(userId);
-        if (!question) throw new Error('No security question was set for this account, so the password can’t be recovered.');
+        if (!question) throw new Error('This account has no security question, so the password can’t be recovered here. Ask an admin to reset it (direct messages from before the reset can’t be opened afterwards).');
         const u = A.users.get(userId);
         UI.screenRecover({
           name: u ? u.name : '', question,
@@ -281,13 +282,17 @@
         onCancel: () => App.lock(),
       });
     }
+    if (A.maintenance() && !A.isOwner()) return showMaintenance();
     UI.screenLoading('Loading your messages…');
+    SC.notify.start();
     try { await Y.start(); } catch (e) {
       console.warn(e);
+      SC.notify.stop();
       await Y.stop();
       return showConnect('Couldn’t load messages from the shared folder (' + (e.message || e.name) + ').');
     }
     Chat.mount();
+    resealSoon();
     lastInput = Date.now();
     watchIdle();
     watchVersion();
@@ -303,10 +308,39 @@
     clearInterval(versionTimer);
     const id = A.me && A.me.id;
     if (Chat.mounted()) Chat.unmount();
+    SC.notify.stop();
     await Y.stop(true);
     await A.lock();
     showSignIn(id, notice);
   };
+
+  /* ================= update mode =================
+   * The super admin turned on update mode (Admin settings → Settings → Update the app): stop syncing so nothing
+   * writes to the share while files are copied, and reload by itself once it's turned off. */
+  let maintTimer = 0;
+  async function showMaintenance() {
+    clearInterval(maintTimer);
+    clearInterval(idleTimer);
+    if (Chat.mounted()) Chat.unmount();
+    SC.notify.stop();
+    try { await Y.stop(true); } catch { /* already stopped */ }
+    const m = A.maintenance() || {};
+    const check = async () => {
+      try { await A.refreshWorkspace(); } catch { /* the share may be busy while files are copied */ }
+      if (!A.maintenance()) { clearInterval(maintTimer); location.reload(); }
+    };
+    UI.screenProblem({
+      title: 'Sankyo Chat is being updated',
+      text: (m.message ? m.message + ' ' : '') + 'The super admin is installing a new version. This page reloads by itself when the update is done, usually within a few minutes. You don’t need to do anything.',
+      actions: [h2btn('Check again', check, true)],
+    });
+    maintTimer = setInterval(check, 10000);
+  }
+  const resealSoon = U.debounce(() => { if (A.me && Chat.mounted()) A.refreshRealNameSeals().catch(e => console.warn('real name', e)); }, 2000);
+  A.events.on('workspace', () => {
+    if (A.me && Chat.mounted() && A.maintenance() && !A.isOwner()) return showMaintenance();
+    resealSoon(); // the admin list may have changed: share my real name with the current admins only
+  });
 
   SC.app = App;
   root.addEventListener('error', e => console.error('Unhandled error', e.error || e.message));

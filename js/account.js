@@ -122,6 +122,16 @@
     const past = (A.ws.formerAdmins && A.ws.formerAdmins[userId]) || [];
     return past.some(p => p && p.kid === kid && ts >= p.since - skew && ts <= p.until);
   };
+  /* ---- update mode ----
+   * Before copying new app files onto the share, the super admin turns on update mode: workspace.json gets
+   * maintenance = {on, ts, message}. Every other app (version 1.9 or newer) stops syncing, shows "Updating",
+   * and reloads by itself once it's turned off, so everyone picks up the new files. */
+  A.maintenance = () => (A.ws && A.ws.maintenance && A.ws.maintenance.on ? A.ws.maintenance : null);
+  A.setMaintenance = async function (on, message) {
+    if (!A.isOwner()) throw err('Only the super admin can do that.');
+    await A.saveWorkspace({ maintenance: on ? { on: true, ts: Date.now(), message: String(message || '').trim().slice(0, 200) } : null });
+    if (SC.sync && SC.sync.noteMyPost) SC.sync.noteMyPost('maint:all', Date.now());
+  };
   A.isRemoved = id => !!(A.ws && ((A.ws.removed || []).includes(id) || A.eff.removed.has(id)));
   A.channelOverride = id => A.eff.channels[id] || {};
   A.autoLockMinutes = () => (A.ws && Number.isFinite(A.ws.autoLockMin) ? A.ws.autoLockMin : 30);
@@ -222,6 +232,67 @@
     if (!A.COLORS.includes(color)) throw err('Pick a background colour.');
     return { name, animal, color };
   }
+  /* ---- real name (only admins can see it) ----
+   * User records are plain signed files on the share, so the real name is sealed separately for each reader:
+   * me (so I can edit it), the super admin and every admin: realName = {to: {userId: {fp, epk, iv, ct}}}.
+   * When the admin list changes, my app re-seals it (A.refreshRealNameSeals), so new admins can read it and
+   * former admins' copies are dropped. Someone who already read it may of course remember it. */
+  A.cleanRealName = t => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  /** Real name is required for every profile. */
+  A.validateRealName = function (t) {
+    const rn = A.cleanRealName(t);
+    if (rn.length < 2) throw err('Enter your real name (first and last name).');
+    return rn;
+  };
+  /** Does my profile have a real name I can read? (False after an admin reset: it was sealed to my old keys.) */
+  A.hasRealName = async () => !!(A.me && await A.realNameOf(A.me.id));
+  const realInfo = (ownerId, readerId) => 'sankyo-realname|' + ownerId + '|' + readerId;
+  const realNames = new Map(); // userId → {key, name} cache of names I could open
+  function realNameReaders() {
+    const ids = [A.me.id, A.ws.adminId].concat(Object.keys(A.ws.admins || {}));
+    return U.uniq(ids).filter(id => { const u = A.users.get(id); return u && !A.isRemoved(id); });
+  }
+  async function sealRealName(name) {
+    const to = {};
+    for (const rid of realNameReaders()) {
+      const u = A.users.get(rid);
+      to[rid] = Object.assign({ fp: u.ecdhFp }, await C.seal(u.keys.ecdh, { name }, realInfo(A.me.id, rid)));
+    }
+    return { v: 1, to };
+  }
+  /** The real name of `userId`, if I'm allowed to see it (admins, and the person themselves). '' when none or not readable. */
+  A.realNameOf = async function (userId) {
+    if (!A.me || (userId !== A.me.id && !A.isAdmin())) return '';
+    const u = A.users.get(userId);
+    const entry = u && u.realName && u.realName.to && u.realName.to[A.me.id];
+    if (!entry || entry.fp !== A.me.ecdhFp) return '';
+    const k = u.updated + '|' + entry.ct;
+    const hit = realNames.get(userId);
+    if (hit && hit.key === k) return hit.name;
+    try {
+      const o = await C.unseal(A.me.priv.ecdh, entry, realInfo(userId, A.me.id));
+      const name = A.cleanRealName(o && o.name);
+      realNames.set(userId, { key: k, name });
+      return name;
+    } catch { return ''; }
+  };
+  /** Has this person given a real name that hasn't been shared with me yet (e.g. I became an admin after they saved it)? */
+  A.realNamePending = userId => { const u = A.users.get(userId); return !!(u && u.realName && u.realName.to && !(u.realName.to[A.me.id] && u.realName.to[A.me.id].fp === A.me.ecdhFp)); };
+  /** Re-seal my real name when the set of admins (or their keys) changed. */
+  A.refreshRealNameSeals = async function () {
+    if (!A.me || !A.ws) return;
+    const u = A.users.get(A.me.id);
+    if (!u || !u.realName || !u.realName.to) return;
+    const want = realNameReaders();
+    const have = u.realName.to;
+    const same = want.length === Object.keys(have).length && want.every(id => have[id] && have[id].fp === A.users.get(id).ecdhFp);
+    if (same) return;
+    const name = await A.realNameOf(A.me.id);
+    if (!name) return; // my own copy is unreadable (e.g. after a password reset): I'll be asked to type it again
+    await A.updateProfile({ name: u.name, animal: u.animal, color: A.avatarColor(u.color), realName: name });
+  };
+  A.cleanTitle = t => String(t || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  A.cleanAbout = t => String(t || '').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 300);
   A.validatePassword = function (pw, pw2) {
     if (String(pw).length < A.MIN_PASSWORD) throw err(`Password must be at least ${A.MIN_PASSWORD} characters.`);
     if (pw2 !== undefined && pw !== pw2) throw err('The two passwords don’t match.');
@@ -285,9 +356,10 @@
   }
 
   /** Brand-new share: create workspace.json, the admin profile and #general. */
-  A.createWorkspace = async function ({ wsName, name, animal, color, team, password, password2, question, answer, keep }) {
+  A.createWorkspace = async function ({ wsName, name, animal, color, team, realName, password, password2, question, answer, keep }) {
     wsName = String(wsName || '').trim() || 'Sankyo Chat';
     const profile = Object.assign(validateProfile({ name, animal, color }), { team: A.validateTeam(team) });
+    realName = A.validateRealName(realName);
     A.validatePassword(password, password2);
     question = A.validateRecovery(question, answer);
     const keys = await C.generateUserKeys();
@@ -307,18 +379,23 @@
     A.ws = ws; cacheWs(ws); recompute();
     await setMe(id, keys.privJwk, false);
     await adminAction('team', id, { team: profile.team });
+    await A.updateProfile({ name: profile.name, animal: profile.animal, color: profile.color, realName });
     await persistSession(!!keep);
   };
 
   /** Join an existing workspace. */
-  A.createProfile = async function ({ name, animal, color, team, password, password2, keep }) {
+  A.createProfile = async function ({ name, animal, color, team, realName, password, password2, question, answer, keep }) {
     await A.refreshUsers();
     const profile = Object.assign(validateProfile({ name, animal, color }), { team: A.validateTeam(team) });
+    realName = A.validateRealName(realName);
     A.validatePassword(password, password2);
+    question = A.validateRecovery(question, answer);
     const keys = await C.generateUserKeys();
     const id = await newUserId();
-    await writeNewUser(id, profile, password, keys, Date.now());
+    // the security question lets them recover a forgotten password without losing their messages
+    await writeNewUser(id, profile, password, keys, Date.now(), { recovery: await makeRecovery(keys.privJwk, question, answer, id) });
     await setMe(id, keys.privJwk, false);
+    await A.updateProfile({ name: profile.name, animal: profile.animal, color: profile.color, realName }); // sealed for me + admins
     await persistSession(!!keep);
   };
 
@@ -383,6 +460,8 @@
   };
 
   /** The security question for this profile, or null if it has none. */
+  /** Can this person recover a forgotten password themselves? (An admin reset writes a key file without one.) */
+  A.hasRecovery = async id => !!(await A.recoveryQuestion(id));
   A.recoveryQuestion = async function (id) {
     const kf = await S.readJSON(`users/${id}.keys.json`);
     return (kf && kf.recovery && kf.recovery.question) || null;
@@ -408,8 +487,8 @@
   };
 
   /** Super admin: set or change the security question. Needs the current password. */
+  /** Everyone can set a security question (it unlocks their own keys only; admins can't use it). */
   A.setRecovery = async function (password, question, answer) {
-    if (!A.isOwner()) throw err('Only the super admin can set a security question.');
     question = A.validateRecovery(question, answer);
     const id = A.me.id;
     const kf = await S.readJSON(`users/${id}.keys.json`);
@@ -419,10 +498,17 @@
     await S.writeJSON(`users/${id}.keys.json`, kf);
   };
 
-  A.updateProfile = async function ({ name, animal, color }) {
+  A.updateProfile = async function ({ name, animal, color, title, about, realName }) {
     const u = A.users.get(A.me.id);
     const p = validateProfile({ name, animal, color }, u.id);
+    // optional "job title" and "about me", shown on the profile card
+    if (title !== undefined) p.title = A.cleanTitle(title);
+    if (about !== undefined) p.about = A.cleanAbout(about);
     const rec = Object.assign({}, u, p, { updated: Date.now() });
+    if (realName !== undefined) {
+      rec.realName = await sealRealName(A.validateRealName(realName));
+      realNames.delete(A.me.id);
+    }
     ['_sign', '_ecdh', 'ecdhFp', 'sig'].forEach(k => delete rec[k]);
     const signed = await signedUser(rec, A.me.priv.sign);
     await S.writeJSON(`users/${u.id}.json`, signed);
@@ -665,6 +751,50 @@
     if (!A.isOwner()) throw err('Only the super admin can remove admins.');
     if (!A.adminEntry(id)) return;
     await A.saveWorkspace(stintChange(id, null));
+  };
+
+  /* ================= admin audit (for the super admin) =================
+   * Private channels, named group chats and private announcements are encrypted, so the super admin can't see
+   * what an admin created or sent. The admin's app therefore also writes admin/audit/<ts>_<userId>_<rand>.json,
+   * signed by them: the kind, the item id and a count in the clear, and the name/title sealed to the super
+   * admin's key alone (like the feedback inbox). Nothing in it reveals message content. */
+  A.AUDIT_KINDS = ['group.create', 'private-channel.create', 'private-channel.make-private', 'announcement.private'];
+  /** @type {Map<string, {id, kind, userId, ts, ref, count, name?, title?, label?}>} */
+  A.auditLog = new Map();
+  const badAudit = new Set();
+
+  A.audit = async function (kind, ref, count, secret) {
+    if (!A.isAdmin() || A.isOwner() || !A.AUDIT_KINDS.includes(kind)) return;
+    const ts = Date.now();
+    const id = `${ts}_${A.me.id}_${U.rand(4)}`;
+    const raw = { v: 1, id, kind, ref: String(ref || ''), count: Number(count) || 0, userId: A.me.id, ts, kid: A.me.signFp };
+    raw.sealed = await C.seal(A.ws.admin.ecdh, secret || {}, 'sankyo-audit|' + id);
+    raw.sig = await C.sign(A.me.priv.sign, raw);
+    await S.writeJSON(`admin/audit/${id}.json`, raw);
+    if (SC.sync && SC.sync.noteMyPost) SC.sync.noteMyPost('audit:all', ts);
+  };
+
+  /** Super admin: pick up new audit records. @returns {Promise<boolean>} changed */
+  A.refreshAudit = async function () {
+    if (!A.isOwner()) return false;
+    const floor = Date.now() - 30 * U.DAY_MS;
+    const names = (await S.list('admin/audit', 'file')).filter(n => U.MSG_RE.test(n) && !A.auditLog.has(n) && !badAudit.has(n));
+    let changed = false;
+    await U.mapLimit(names, 6, async n => {
+      const p = U.parseMsgName(n);
+      if (p.ts < floor) { badAudit.add(n); return; }
+      const raw = await S.readJSON('admin/audit/' + n);
+      if (!raw) return;
+      if (raw.id !== p.id || raw.userId !== p.userId || raw.ts !== p.ts || !A.AUDIT_KINDS.includes(raw.kind)) { badAudit.add(n); return; }
+      const key = await actorKey(raw.userId, raw.kid);
+      if (!key || !(await C.verify(key, raw)) || !A.canActAt(raw.userId, raw.kid, raw.ts)) { badAudit.add(n); return; }
+      let secret = {};
+      try { secret = await C.unseal(A.me.priv.ecdh, raw.sealed, 'sankyo-audit|' + raw.id); } catch { /* shown without the name */ }
+      A.auditLog.set(n, { id: raw.id, kind: raw.kind, userId: raw.userId, ts: raw.ts, ref: String(raw.ref || ''), count: Number(raw.count) || 0,
+        name: String(secret.name || '').slice(0, 60), title: String(secret.title || '').slice(0, 120), label: String(secret.label || '').slice(0, 80) });
+      changed = true;
+    });
+    return changed;
   };
 
   /* ================= feedback inbox ================= */

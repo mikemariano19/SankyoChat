@@ -406,6 +406,7 @@
     const err = errBox();
     const wsName = h('input', { class: 'input', value: 'Sankyo Chat', maxlength: 40, id: 'f-ws' });
     const name = h('input', { class: 'input', maxlength: 32, id: 'f-name', autocomplete: 'off', autofocus: true });
+    const realName = h('input', { class: 'input', maxlength: 60, id: 'f-real', autocomplete: 'name', placeholder: 'e.g. Maria Santos' });
     const pw = h('input', { class: 'input', type: 'password', id: 'f-pw', autocomplete: 'new-password' });
     const pw2 = h('input', { class: 'input', type: 'password', id: 'f-pw2', autocomplete: 'new-password' });
     const question = h('input', { class: 'input', id: 'f-q', maxlength: 120, autocomplete: 'off', placeholder: 'e.g. What was the name of my first manager?' });
@@ -436,7 +437,7 @@
     const form = h('form', { onsubmit: e => {
       e.preventDefault();
       UI.busy(submit, 'Creating your security keys…', () => onSubmit({
-        wsName: wsName.value, name: name.value, animal: state.animal, color: state.color, team: teamField.input.value, password: pw.value, password2: pw2.value, question: question.value, answer: answer.value, keep: keep.checked,
+        wsName: wsName.value, name: name.value, animal: state.animal, color: state.color, team: teamField.input.value, realName: realName.value, password: pw.value, password2: pw2.value, question: question.value, answer: answer.value, keep: keep.checked,
       }), err);
     } },
       connected ? h('div', { class: 'note note-ok top' }, UI.icon('check'), h('div', null, 'Connected to ', b(connected))) : null,
@@ -446,6 +447,8 @@
       err,
       withWorkspace ? h('div', { class: 'field' }, h('label', { for: 'f-ws' }, 'Workspace name'), wsName) : null,
       h('div', { class: 'field' }, h('label', { for: 'f-name' }, 'Display name'), name, h('div', { class: 'hint' }, '2–32 characters. Must be unique in this workspace.')),
+      h('div', { class: 'field' }, h('label', { for: 'f-real' }, 'Real name'), realName,
+        h('div', { class: 'hint' }, 'Required. Only admins and the super admin can see it. It’s encrypted for them; everyone else sees your display name.')),
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Group'), teamField.el,
         h('div', { class: 'hint' }, withWorkspace
           ? 'Required. As the super admin, yours is accepted straight away.'
@@ -456,11 +459,11 @@
       h('div', { class: 'field' }, h('label', { for: 'f-pw2' }, 'Confirm password'), pw2,
         h('div', { class: 'hint' }, withWorkspace
           ? 'Your password protects your security keys. If you forget it, your security question below is the only way back in.'
-          : 'Your password protects your security keys. Nobody can recover it, not even the admin: they can only reset it, and your direct messages from before the reset can’t be opened.')),
-      withWorkspace ? h('div', { class: 'field' }, h('label', { for: 'f-q' }, 'Security question'), question,
-        h('div', { class: 'hint' }, 'Used only if you forget your password. Pick something staff couldn’t guess or look up.')) : null,
-      withWorkspace ? h('div', { class: 'field' }, h('label', { for: 'f-a' }, 'Answer'), answer,
-        h('div', { class: 'hint' }, `At least ${A.MIN_ANSWER} characters. Capitals and extra spaces don’t matter. Anyone with the answer can take over the super admin account, so treat it like a second password.`)) : null,
+          : 'Your password protects your security keys. If you forget it, your security question below gets you back in with all your messages. Admins can’t recover it for you.')),
+      h('div', { class: 'field' }, h('label', { for: 'f-q' }, 'Security question'), question,
+        h('div', { class: 'hint' }, 'Used only if you forget your password: “Forgot password?” on the sign-in screen. Pick something coworkers couldn’t guess or look up.')),
+      h('div', { class: 'field' }, h('label', { for: 'f-a' }, 'Answer'), answer,
+        h('div', { class: 'hint' }, `At least ${A.MIN_ANSWER} characters. Capitals and extra spaces don’t matter. Anyone with the answer can get into your account, so treat it like a second password.`)),
       h('div', { class: 'field' }, h('label', { class: 'check' }, keep, h('span', null, 'Keep me signed in on this PC', h('div', { class: 'hint' }, 'Only tick this on a PC nobody else uses.')))),
       submit,
       footer);
@@ -509,7 +512,7 @@
     const forgot = h('button', { class: 'link-btn', type: 'button', onclick: () => {
       const showErr = t => { err.textContent = t; err.classList.remove('hidden'); };
       if (!selected) return showErr('Pick your name first.');
-      if (!onRecover || !A.ws || selected !== A.ws.adminId) return showErr('Ask your admin to reset your password.');
+      if (!onRecover) return showErr('Ask your admin to reset your password.');
       UI.busy(forgot, null, () => onRecover(selected), err);
     } }, 'Forgot password?');
     const form = h('form', { onsubmit: e => {
@@ -549,7 +552,7 @@
     };
   };
 
-  /** Super admin forgot their password: answer the security question, choose a new password. */
+  /** Forgot password: answer your security question, choose a new password. Keeps every message. */
   UI.screenRecover = function ({ name, question, onSubmit, onCancel }) {
     const err = errBox();
     const ans = h('input', { class: 'input', type: 'password', id: 'r-a', autocomplete: 'off', autofocus: true });

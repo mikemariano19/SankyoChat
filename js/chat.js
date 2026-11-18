@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
   const SC = root.SC;
-  const U = SC.util, A = SC.account, Y = SC.sync, UI = SC.ui, C = SC.crypto, S = SC.store;
+  const U = SC.util, A = SC.account, Y = SC.sync, UI = SC.ui, C = SC.crypto, S = SC.store, N = SC.notify;
   const h = UI.h, icon = UI.icon;
   /** @namespace SC.chat */
   const Chat = {};
@@ -24,8 +24,26 @@
 
   /** The Announcements channel isn't a real conversation; it has this reserved id. */
   const ANN = '@announcements';
-  const isAnn = () => st.openId === ANN;
+  /* Announcements are split into feeds: the main one (everyone, and private ones to mixed people) and one per
+   * group (private announcements sent to people in that group). Ids: ANN and ANN + ':' + groupId. */
+  const isAnnKey = id => typeof id === 'string' && (id === ANN || id.startsWith(ANN + ':'));
+  const isAnn = () => isAnnKey(st.openId);
+  const annKey = f => (f ? ANN + ':' + f : ANN);
+  const annFeed = () => (isAnn() && st.openId.length > ANN.length ? st.openId.slice(ANN.length + 1) : '');
+  /** Feeds I can see: the main one, plus my own group's (the super admin sees every group's). */
+  const annFeeds = () => [''].concat(A.teamList().map(t => t.id).filter(t => A.isOwner() || A.teamOf(meId()) === t));
+  /** The feed an announcement shows in for me (falls back to the main one if I can't see that group's feed). */
+  const feedOf = a => { const f = Y.annFeedOf(a); return f && annFeeds().includes(f) ? f : ''; };
+  const shortTeam = f => (A.teamName(f) || f).replace(/\s+group$/i, '');
+  const feedName = f => (f ? `Announcements (${shortTeam(f)})` : 'Announcements');
+  const feedPending = f => Y.pendingAnnouncements().filter(a => feedOf(a) === f);
+  /** PICKUP GROUP / INPUT GROUP member lists (sidebar → Groups) use '@team:<groupId>'. They aren't conversations. */
+  const TEAM = '@team:';
+  const isTeam = () => typeof st.openId === 'string' && st.openId.startsWith(TEAM);
+  const openTeamId = () => (isTeam() ? st.openId.slice(TEAM.length) : '');
   const cur = () => Y.chans.get(st.openId);
+  /** How many of these people are online right now. */
+  const onlineCount = ids => ids.filter(id => Y.presenceOf(id).state === 'online').length;
   const meId = () => A.me.id;
   /** Batch renders. Animation frames pause in background tabs, so fall back to a timer there
    *  (the tab title's unread count must keep updating while the window is hidden). */
@@ -76,21 +94,25 @@
         UI.toast(`You were removed from ${Y.info(ch).name}.`);
         if (ch.id === st.openId) { UI.closeAll(); Chat.open(Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]); }
       }),
-      Y.events.on('presence', changed => { schedule('side', 'head'); if (seenSig(cur()) !== st.seenSig || (isAnn() && changed && A.isAdmin())) schedule('msgs'); }),
+      Y.events.on('presence', changed => { schedule('side', 'head'); if (seenSig(cur()) !== st.seenSig || (isAnn() && changed && A.isAdmin()) || (isTeam() && changed)) schedule('msgs'); }),
+      N.events.on('change', () => { schedule('side'); if (st.inbox) st.inbox.draw(); }),
+      N.events.on('open', () => notificationsDialog()),
       Y.events.on('connection', () => schedule('side', 'banners')),
       Y.events.on('incoming', onIncoming),
       Y.events.on('inbox', () => schedule('side')),
       Y.events.on('announcements', () => { schedule('side'); if (isAnn()) schedule('msgs'); showPendingAnnouncement(); }),
-      A.events.on('workspace', () => { schedule('side', 'head', 'composer', 'msgs', 'banners'); if (A.isRemoved(meId())) SC.app.lock('Your account was removed by the admin.'); }),
-      A.events.on('users', () => schedule('side', 'head', 'msgs', 'banners')),
+      A.events.on('workspace', () => { schedule('side', 'head', 'composer', 'msgs', 'banners'); if (A.isRemoved(meId())) SC.app.lock('Your account was removed by the admin.'); else askTeamIfNeeded(); }),
+      A.events.on('users', () => { schedule('side', 'head', 'msgs', 'banners'); askTeamIfNeeded(); }),
       A.events.on('wsTampered', () => { st.banners.wsTampered = true; schedule('banners'); }),
     ];
     const last = U.ls.get('lastOpen.' + A.ws.id);
-    Chat.open(Y.chans.has(last) || last === ANN ? last : (Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]));
+    const teamOk = typeof last === 'string' && last.startsWith(TEAM) && A.teamList().some(t => TEAM + t.id === last);
+    const annOk = isAnnKey(last) && annFeeds().includes(last.slice(ANN.length + 1));
+    Chat.open(Y.chans.has(last) || annOk || teamOk ? last : (Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]));
     if (A.isOwner()) A.loadInbox().then(ch => { if (ch) schedule('side'); }).catch(() => {});
     showPendingAnnouncement();
     renderBanners();
-    if (A.needsTeam()) chooseTeamDialog({ mandatory: true });
+    if (!askTeamIfNeeded()) askSetupIfNeeded().then(shown => { if (!shown && el.root) showWhatsNew(); });
     if (A.isAdmin() && !U.ls.get(`adminGuideSeen.${A.ws.id}.${meId()}`)) {
       setTimeout(() => { if (el.root) UI.toast('You’re an admin. See what you can do: ⚙ (bottom left) → Admin guide.'); }, 3000);
     }
@@ -110,13 +132,17 @@
     el = {};
     st.openId = null;
     st.annFresh = null;
+    st.inbox = null;
+    st.teamAsk = false;
+    st.setupAsk = false;
   };
   Chat.mounted = () => !!el.root;
   Chat.showBanner = function (name, on) { st.banners[name] = on; schedule('banners'); };
 
   /** Open a channel or conversation. */
   Chat.open = async function (id, opts = {}) {
-    if (id === ANN) return openAnnouncements();
+    if (isAnnKey(id)) return openAnnouncements(id.length > ANN.length ? id.slice(ANN.length + 1) : '');
+    if (typeof id === 'string' && id.startsWith(TEAM)) return openTeam(id.slice(TEAM.length));
     const ch = Y.chans.get(id);
     if (!ch) return;
     if (el.ta && st.openId) st.drafts[st.openId] = el.ta.value;
@@ -176,22 +202,45 @@
       }, lead, h('span', { class: 'lbl' }, info.name), muted ? icon('bellOff') : null, badge);
     };
     const inboxCount = A.isOwner() ? A.inboxUnread() : 0;
-    UI.set(el.side, 
+    const notifCount = N.unreadCount();
+    const quiet = N.isQuiet();
+    // Groups (PICKUP / INPUT): a member list each, not a conversation
+    const teamRows = A.teamList().map(t => {
+      const tid = TEAM + t.id;
+      const active = st.openId === tid;
+      const members = A.teamMembers(t.id);
+      const waiting = A.isAdmin() ? A.teamPending().filter(u => A.teamRequest(u.id) === t.id).length : 0;
+      const mine = A.teamOf(meId()) === t.id;
+      return h('button', { class: 'side-item team-item' + (active ? ' active' : ''), 'data-open': tid, 'data-key': 'ch:' + tid, 'aria-current': active ? 'page' : null,
+        'aria-label': `${t.name}, ${members.length} ${members.length === 1 ? 'member' : 'members'}` + (mine ? ', your group' : '') + (waiting ? `, ${waiting} waiting for acceptance` : '') },
+      icon('users'), h('span', { class: 'lbl' }, t.name), mine ? h('span', { class: 'you-tag' }, 'You') : null,
+      waiting ? h('span', { class: 'wait-dot', title: `${waiting} waiting for acceptance` }) : null,
+      h('span', { class: 'cnt' }, String(members.length)));
+    });
+    UI.set(el.side,
       h('div', { class: 'side-head' },
-        h('h1', null, A.ws.name),
+        h('div', { class: 'side-title' },
+          h('h1', null, A.ws.name),
+          h('button', { class: 'icon-btn bell-btn' + (notifCount ? ' has' : ''), 'data-act': 'notifications', 'data-key': 'bell',
+            'aria-label': 'Notifications' + (notifCount ? `, ${notifCount} unread` : '') + (quiet ? ', do not disturb is on' : ''), title: quiet ? 'Notifications (do not disturb is on)' : 'Notifications' },
+          icon(quiet ? 'bellOff' : 'bell'), notifCount ? h('span', { class: 'badge red bell-badge' }, notifCount > 99 ? '99+' : String(notifCount)) : null)),
         h('div', { class: 'conn' }, UI.dot(Y.connected ? 'online' : 'offline'), Y.connected ? 'Shared drive connected' : 'Not connected to the shared drive')),
       h('button', { class: 'jump', 'data-act': 'jump', 'data-key': 'jump' }, icon('search'), 'Search or jump to…', h('kbd', null, 'Ctrl K')),
       h('nav', { class: 'side-scroll' },
-        (() => {
-          const n = Y.pendingAnnouncements().length;
-          const active = isAnn();
-          return h('button', { class: 'side-item ann-side' + (active ? ' active' : '') + (n && !active ? ' unread' : ''), 'data-open': ANN, 'data-key': 'ch:' + ANN,
-            'aria-current': active ? 'page' : null, 'aria-label': 'Announcements' + (n ? `, ${n} new` : '') },
-          icon('megaphone'), h('span', { class: 'lbl' }, 'Announcements'), n && !active ? h('span', { class: 'badge red' }, String(n)) : null);
-        })(),
+        annFeeds().map(f => {
+          const n = feedPending(f).length;
+          const active = isAnn() && annFeed() === f;
+          return h('button', { class: 'side-item ann-side' + (active ? ' active' : '') + (n && !active ? ' unread' : ''), 'data-open': annKey(f), 'data-key': 'ch:' + annKey(f),
+            'aria-current': active ? 'page' : null, 'aria-label': feedName(f) + (n ? `, ${n} new` : '') },
+          icon('megaphone'), h('span', { class: 'lbl' }, feedName(f)), n && !active ? h('span', { class: 'badge red' }, String(n)) : null);
+        }),
+        h('div', { class: 'side-sec' }, h('span', null, 'Groups')),
+        teamRows,
         h('div', { class: 'side-sec' }, h('span', null, 'Channels'), A.isAdmin() ? h('button', { class: 'icon-btn', 'data-act': 'new-channel', 'data-key': 'newch', 'aria-label': 'Create a channel', title: 'Create a channel' }, icon('plus')) : null),
         pub.map(item),
-        h('div', { class: 'side-sec' }, h('span', null, 'Group chats'), h('button', { class: 'icon-btn', 'data-act': 'new-group', 'data-key': 'newgrp', 'aria-label': 'Create a group chat', title: 'Create a group chat' }, icon('plus'))),
+        h('div', { class: 'side-sec' }, h('span', null, 'Group chats'), h('span', { class: 'row', style: { gap: '0' } },
+          h('button', { class: 'icon-btn', 'data-act': 'browse-groups', 'data-key': 'browse', 'aria-label': 'Browse groups you can ask to join', title: 'Browse groups' }, icon('search')),
+          h('button', { class: 'icon-btn', 'data-act': 'new-group', 'data-key': 'newgrp', 'aria-label': 'Create a group chat', title: 'Create a group chat' }, icon('plus')))),
         groups.length ? groups.map(item) : h('div', { class: 'side-empty' }, 'No group chats yet'),
         h('div', { class: 'side-sec' }, h('span', null, 'Direct messages'), h('button', { class: 'icon-btn', 'data-act': 'new-dm', 'data-key': 'newdm', 'aria-label': 'New direct message', title: 'New direct message' }, icon('plus'))),
         dms.length ? dms.map(item) : h('div', { class: 'side-empty' }, 'No conversations yet')),
@@ -204,7 +253,7 @@
           h('div', { class: 'st' }, UI.dot(myP.state), myP.statusText || UI.stateLabel(myP.state))),
         h('button', { class: 'icon-btn', 'data-act': 'me-menu', 'data-key': 'me', 'aria-label': 'Profile and settings', title: 'Profile and settings' }, icon('settings'))));
     if (focusKey) { const f = el.side.querySelector(`[data-key="${CSS.escape(focusKey)}"]`); if (f) f.focus(); }
-    const n = Y.totalUnread();
+    const n = Y.totalUnread() + notifCount;
     document.title = (n ? `(${n}) ` : '') + A.ws.name;
   }
 
@@ -217,6 +266,8 @@
       case 'new-channel': return A.isAdmin() ? newChannelDialog() : null;
       case 'new-dm': return newMessageDialog();
       case 'new-group': return newGroupDialog();
+      case 'browse-groups': return browseGroupsDialog();
+      case 'notifications': return notificationsDialog();
       case 'feedback': return feedbackDialog();
       case 'inbox': return A.isOwner() ? inboxDialog() : null;
       case 'me-menu': return profileMenu(t);
@@ -228,9 +279,19 @@
   function renderHeader() {
     const menuBtn = h('button', { class: 'icon-btn menu-toggle', 'aria-label': 'Show sidebar', onclick: () => el.root.classList.toggle('side-open') }, icon('menu'));
     if (isAnn()) {
+      const f = annFeed();
       UI.set(el.head, menuBtn, h('span', { class: 'avatar ann-avatar', style: { width: '34px', height: '34px' } }, icon('megaphone')),
-        h('div', { class: 'two' }, h('div', { class: 'title' }, h('span', { class: 'nm' }, 'Announcements')),
-          h('div', { class: 'sub' }, 'From the admins · to everyone, or privately to chosen people')));
+        h('div', { class: 'two' }, h('div', { class: 'title' }, h('span', { class: 'nm' }, feedName(f)), f ? h('span', { class: 'pill' }, icon('lock'), 'Private') : null),
+          h('div', { class: 'sub' }, f ? `From the admins · only for ${A.teamName(f)}, encrypted` : 'From the admins · to everyone, or privately to chosen people')),
+        h('div', { class: 'tools' }, h('button', { class: 'icon-btn', 'aria-label': 'Who can read announcements', title: 'Who can read this?', onclick: () => privacyDialog('announcements') }, icon('shield'))));
+      return;
+    }
+    if (isTeam()) {
+      const t = A.teamList().find(x => x.id === openTeamId());
+      const ids = A.teamMembers(openTeamId()).map(u => u.id);
+      UI.set(el.head, menuBtn, h('span', { class: 'avatar ann-avatar', style: { width: '34px', height: '34px' } }, icon('users')),
+        h('div', { class: 'two' }, h('div', { class: 'title' }, h('span', { class: 'nm' }, t ? t.name : 'Group')),
+          h('div', { class: 'sub' }, `${ids.length} ${ids.length === 1 ? 'member' : 'members'} · `, h('span', { class: 'online-n' }, `${onlineCount(ids)} online`))));
       return;
     }
     const ch = cur();
@@ -240,27 +301,31 @@
     const infoBtn = h('button', { class: 'icon-btn', 'aria-label': 'Details', title: 'Details', onclick: () => channelInfoDialog(ch) }, icon('info'));
     if (ch.kind === 'public') {
       const count = Y.members(ch).length;
+      const on = onlineCount(Y.members(ch));
       UI.set(el.head, menuBtn,
         h('div', { class: 'title' }, h('span', { class: 'hash', 'aria-hidden': 'true' }, '#'), h('span', { class: 'nm' }, info.name),
           info.archived ? h('span', { class: 'pill grey' }, 'Archived') : null, Y.isMuted(ch.id) ? icon('bellOff') : null),
         info.description ? h('div', { class: 'topic', title: info.description }, info.description) : null,
         h('div', { class: 'tools' },
-          h('button', { class: 'members-btn', 'aria-label': `${count} members`, title: 'Members', onclick: () => membersDialog(ch) }, icon('users'), String(count)),
+          h('span', { class: 'online-n', title: `${on} of ${count} online now` }, UI.dot('online'), `${on} online`),
+          h('button', { class: 'members-btn', 'aria-label': `${count} members, ${on} online`, title: 'Members', onclick: () => membersDialog(ch) }, icon('users'), String(count)),
           searchBtn, infoBtn));
       return;
     }
     if (Y.isPrivateChannel(ch)) {
       const count = Y.members(ch).length;
+      const on = onlineCount(Y.members(ch));
       UI.set(el.head, menuBtn,
         h('div', { class: 'title' }, icon('lock', 'title-lock'), h('span', { class: 'nm' }, info.name), Y.isMuted(ch.id) ? icon('bellOff') : null),
         info.description ? h('div', { class: 'topic', title: info.description }, info.description) : null,
         h('div', { class: 'tools' },
-          h('span', { class: 'e2e', title: 'Only the people invited can read it' }, icon('lock'), 'Private · encrypted'),
-          h('button', { class: 'members-btn', 'aria-label': `${count} members`, title: 'Members', onclick: () => channelInfoDialog(ch) }, icon('users'), String(count)),
+          h('button', { class: 'e2e', title: 'Only the people invited can read it. Click to learn more.', onclick: () => privacyDialog('private') }, icon('lock'), 'Private · encrypted'),
+          h('span', { class: 'online-n', title: `${on} of ${count} online now` }, UI.dot('online'), `${on} online`),
+          h('button', { class: 'members-btn', 'aria-label': `${count} members, ${on} online`, title: 'Members', onclick: () => channelInfoDialog(ch) }, icon('users'), String(count)),
           searchBtn, infoBtn));
       return;
     }
-    const badges = [h('span', { class: 'e2e', title: 'Only the people in this conversation can read it' }, icon('lock'), 'End-to-end encrypted'),
+    const badges = [h('button', { class: 'e2e', title: 'Only the people in this conversation can read it. Click to learn more.', onclick: () => privacyDialog(ch.kind === 'dm' ? 'dm' : 'group') }, icon('lock'), 'End-to-end encrypted'),
       h('span', { class: 'retention' }, 'Messages delete after 7 days')];
     if (ch.kind === 'dm') {
       const other = A.users.get(Y.dmOther(ch));
@@ -272,7 +337,7 @@
     } else {
       UI.set(el.head, menuBtn, h('span', { class: 'avatar', style: { width: '34px', height: '34px', background: 'var(--surface-2)', color: 'var(--muted)' } }, icon('users')),
         h('div', { class: 'two' }, h('div', { class: 'title' }, h('span', { class: 'nm' }, info.name)),
-          h('div', { class: 'sub' }, `${Y.members(ch).length} people`)),
+          h('div', { class: 'sub' }, `${Y.members(ch).length} people · ${onlineCount(Y.members(ch))} online`)),
         h('div', { class: 'tools' }, badges, searchBtn, infoBtn));
     }
   }
@@ -329,6 +394,11 @@
       const btn = h('button', { class: 'btn btn-sm btn-reconnect' }, 'Reconnect');
       btn.addEventListener('click', () => UI.busy(btn, null, async () => { await Y.reconnect(); UI.toast('Reconnected', 'ok'); }));
       list.push(h('div', { class: 'banner', role: 'alert' }, icon('alert'), h('span', null, h('b', null, 'Lost access to the shared folder. '), 'Messages you type will wait here until you reconnect.'), btn));
+    }
+    if (A.isOwner() && A.maintenance()) {
+      list.push(h('div', { class: 'banner danger', role: 'status' }, icon('refresh'),
+        h('span', null, h('b', null, 'Update mode is on. '), 'Everyone else is disconnected and waiting. Copy the new app files onto the share (never over the data folder), then click Finish update.'),
+        h('button', { class: 'btn btn-sm btn-primary', onclick: () => finishUpdate() }, 'Finish update')));
     }
     const waiting = A.isAdmin() ? A.teamPending() : [];
     if (waiting.length) {
@@ -527,7 +597,8 @@
       main.appendChild(body);
     }
     const row = h('div', { class: cls, 'data-id': m.id },
-      h('div', { class: 'msg-gutter' }, grouped ? h('span', { class: 'hover-time' }, time) : UI.avatar(u, 40)), main);
+      h('div', { class: 'msg-gutter' }, grouped ? h('span', { class: 'hover-time' }, time)
+        : h('button', { class: 'avatar-btn', 'data-action': 'profile', 'aria-label': `${u ? u.name : 'Unknown user'}: view profile`, title: 'View profile' }, UI.avatar(u, 40))), main);
     if (!m.local && shown && body && !Y.info(ch).archived) {
       const tools = h('div', { class: 'msg-tools', role: 'toolbar', 'aria-label': 'Message actions' },
         SC.emoji.quick.slice(0, 3).map(e => h('button', { class: 'icon-btn quick', 'data-action': 'react', 'data-emoji': e, 'aria-label': 'React with ' + e, title: 'React ' + e }, e)),
@@ -579,6 +650,7 @@
 
   function renderMessages() {
     if (isAnn()) return renderAnnouncements();
+    if (isTeam()) return renderTeam();
     const ch = cur();
     if (!ch || !el.msgs) return;
     const box = el.msgs;
@@ -631,6 +703,7 @@
 
   function maybeMarkRead() {
     if (isAnn()) return ackVisibleAnnouncements();
+    if (isTeam()) return;
     const ch = cur();
     if (!ch || !el.msgs) return;
     const box = el.msgs;
@@ -707,6 +780,7 @@
     const t = e.target.closest('[data-action]');
     if (!t) return;
     if (isAnn()) return onAnnClick(t);
+    if (isTeam()) return onTeamClick(t);
     const row = t.closest('.msg');
     const ch = cur();
     if (!row || !ch) return;
@@ -939,11 +1013,25 @@
   /* ================= composer ================= */
 
   function buildComposer() {
+    if (isTeam()) {
+      el.ta = null;
+      const tid = openTeamId();
+      const ids = A.teamMembers(tid).map(u => u.id).filter(id => id !== meId());
+      UI.set(el.composerWrap, h('div', { class: 'ann-compose' },
+        h('span', { class: 'muted' }, 'Everyone accepted into this group by an admin.'),
+        h('span', { class: 'row', style: { gap: '8px' } },
+          h('button', { class: 'btn', disabled: !ids.length || ids.length + 1 > Y.MAX_GROUP, title: ids.length + 1 > Y.MAX_GROUP ? `Group chats can have up to ${Y.MAX_GROUP} people` : null,
+            onclick: () => newGroupDialog({ name: A.teamName(tid), userIds: ids }) }, icon('message'), 'Start group chat with everyone'),
+          A.isAdmin() && (Y.announceTeam() === null || Y.announceTeam() === tid) ? h('button', { class: 'btn btn-primary', disabled: !ids.length, onclick: () => newAnnouncementDialog({ team: tid }) }, icon('megaphone'), 'Send announcement to this group') : null)));
+      return;
+    }
     if (isAnn()) {
       el.ta = null;
-      UI.set(el.composerWrap, A.isAdmin()
-        ? h('div', { class: 'ann-compose' }, h('span', { class: 'muted' }, 'Announcements pop up for everyone and stay here for a year.'),
-          h('button', { class: 'btn btn-primary', onclick: newAnnouncementDialog }, icon('megaphone'), 'New announcement'))
+      const f = annFeed();
+      const canPost = A.isAdmin() && (!f || Y.announceTeam() === null || Y.announceTeam() === f);
+      UI.set(el.composerWrap, canPost
+        ? h('div', { class: 'ann-compose' }, h('span', { class: 'muted' }, f ? `Only people in ${A.teamName(f)} get these. They pop up and stay here for a year.` : 'Announcements pop up for everyone and stay here for a year.'),
+          h('button', { class: 'btn btn-primary', onclick: () => newAnnouncementDialog(f ? { team: f } : {}) }, icon('megaphone'), f ? `New announcement to ${shortTeam(f)}` : 'New announcement'))
         : h('div', { class: 'archived-note' }, 'Only admins can post here. New announcements also pop up on your screen.'));
       return;
     }
@@ -964,14 +1052,12 @@
     el.count = h('span', { class: 'count' });
     el.hintLeft = h('span');
     const fileInput = h('input', { type: 'file', multiple: true, class: 'hidden', onchange: () => { addFiles(fileInput.files); fileInput.value = ''; } });
-    const fmt = (name, label, before, after) => h('button', { class: 'icon-btn', type: 'button', 'aria-label': label, title: label, onclick: () => wrapSel(ta, before, after) }, icon(name));
     const emojiBtn = h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Insert emoji', title: 'Emoji' }, icon('smile'));
     emojiBtn.addEventListener('click', () => UI.emojiPicker(emojiBtn, e => insertText(ta, e)));
     el.sendBtn = h('button', { class: 'send-btn', type: 'button', 'aria-label': 'Send', title: 'Send (Enter)', onclick: send }, icon('send'));
     UI.set(el.composerWrap, 
       h('div', { class: 'composer' },
         el.replyBar,
-        h('div', { class: 'fmt-bar' }, fmt('bold', 'Bold (Ctrl+B)', '**'), fmt('italic', 'Italic (Ctrl+I)', '*'), fmt('code', 'Code', '`')),
         el.chips,
         h('div', { class: 'comp-row' }, ta, emojiBtn,
           h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Attach files (max 5 MB each)', title: 'Attach files', onclick: () => fileInput.click() }, icon('clip')),
@@ -1000,16 +1086,6 @@
   function insertText(ta, text) {
     ta.focus();
     ta.setRangeText(text, ta.selectionStart, ta.selectionEnd, 'end');
-    ta.dispatchEvent(new Event('input'));
-  }
-  function wrapSel(ta, before, after) {
-    after = after || before;
-    const s = ta.selectionStart, e = ta.selectionEnd;
-    const sel = ta.value.slice(s, e);
-    if (before === '`' && sel.includes('\n')) { before = '```\n'; after = '\n```'; }
-    ta.focus();
-    ta.setRangeText(before + sel + after, s, e, 'end');
-    ta.setSelectionRange(s + before.length, s + before.length + sel.length);
     ta.dispatchEvent(new Event('input'));
   }
 
@@ -1102,7 +1178,6 @@
     if (mention && mentionKey(e)) return;
     const ta = el.ta;
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); return; }
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'b' || e.key === 'i')) { e.preventDefault(); wrapSel(ta, e.key === 'b' ? '**' : '*'); return; }
     if (e.key === 'ArrowUp' && !ta.value) {
       const ch = cur();
       const last = ch && Y.sorted(ch).slice().reverse().find(m => m.userId === meId() && !m.deleted && !m.hidden && m.verified && !m.decryptError && !m.poll);
@@ -1175,6 +1250,7 @@
       const mentioned = m.mentions.includes(meId()) || m.mentions.includes('channel');
       if (ch.kind === 'public' && !mentioned) continue;
       if (viewing) continue;
+      if (mentioned && !N.allow('mentions')) continue;
       const who = A.name(m.userId);
       const title = ch.kind === 'dm' ? who : `${who} in ${chName(ch)}`;
       const body = m.decryptError ? 'New message' : (m.text ? (m.poll ? '📊 Poll: ' : '') + m.text.replace(/\s+/g, ' ').slice(0, 140) : '📎 Sent an attachment');
@@ -1244,7 +1320,8 @@
     };
     const pp = peoplePicker({ multi: true, max: Y.MAX_GROUP - 1, onChange: update });
     pp.el[0].removeAttribute('autofocus');
-    const invite = h('div', { class: 'field' + (priv ? '' : ' hidden') }, h('span', { class: 'label' }, 'Invite people'), count, pp.el);
+    const listed = listedCheck('nc-listed', false);
+    const invite = h('div', { class: 'field' + (priv ? '' : ' hidden') }, h('span', { class: 'label' }, 'Invite people'), count, pp.el, listed.el);
     const note = h('p', { class: 'muted', style: { fontSize: '14px' } });
     const seg = h('div', { class: 'vis-seg', role: 'radiogroup', 'aria-label': 'Who can see it' });
     const drawSeg = () => {
@@ -1260,7 +1337,7 @@
     drawSeg();
     const form = h('form', { onsubmit: e => { e.preventDefault(); UI.busy(ok, null, async () => {
       const ch = priv
-        ? await Y.createPrivateChannel({ name: name.value, description: desc.value, userIds: Array.from(pp.picked), replaces: preset.replaces })
+        ? await Y.createPrivateChannel({ name: name.value, description: desc.value, userIds: Array.from(pp.picked), replaces: preset.replaces, listed: listed.cb.checked })
         : await Y.createChannel({ name: name.value, description: desc.value });
       if (preset.replaces) { try { await A.setChannelOverride(preset.replaces, { archived: true }); } catch (ex) { UI.toast('The new channel was made, but the old one couldn’t be archived: ' + ex.message, 'error'); } }
       m.close(); Chat.open(ch.id);
@@ -1284,13 +1361,13 @@
     if (go) newChannelDialog({ private: true, name: info.name, description: info.description, replaces: ch.id });
   }
 
-  function peoplePicker({ multi, max, onChange, exclude = [] }) {
+  function peoplePicker({ multi, max, onChange, exclude = [], only = null }) {
     const picked = new Set();
     const q = h('input', { class: 'input', placeholder: 'Find people', 'aria-label': 'Find people', autofocus: true });
     const list = h('div', { class: 'people-list' });
     function draw() {
       const s = q.value.trim().toLowerCase();
-      UI.set(list, ...A.activeUsers().filter(u => u.id !== meId() && !exclude.includes(u.id) && (!s || u.name.toLowerCase().includes(s))).map(u => {
+      UI.set(list, ...A.activeUsers().filter(u => u.id !== meId() && !exclude.includes(u.id) && (!only || only(u.id)) && (!s || u.name.toLowerCase().includes(s))).map(u => {
         const p = Y.presenceOf(u.id);
         const cb = h('input', { type: multi ? 'checkbox' : 'radio', name: 'pp', checked: picked.has(u.id), 'aria-label': u.name });
         cb.addEventListener('change', () => {
@@ -1311,13 +1388,14 @@
       add(ids) {
         let skipped = 0;
         for (const id of ids) {
-          if (id === meId() || exclude.includes(id) || picked.has(id) || !A.users.get(id) || A.isRemoved(id)) continue;
+          if (id === meId() || exclude.includes(id) || (only && !only(id)) || picked.has(id) || !A.users.get(id) || A.isRemoved(id)) continue;
           if (picked.size >= max) { skipped++; continue; }
           picked.add(id);
         }
         if (skipped) UI.toast(`Up to ${max} people. ${skipped} weren’t added.`);
         onChange(picked); draw();
       },
+      remove(ids) { ids.forEach(id => picked.delete(id)); onChange(picked); draw(); },
     };
   }
 
@@ -1334,9 +1412,17 @@
     foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
   }
 
-  function newGroupDialog() {
+  /** Checkbox: list this group in Browse groups so people can ask to join. */
+  function listedCheck(id, checked) {
+    const cb = h('input', { type: 'checkbox', id, checked: !!checked });
+    return { cb, el: h('label', { class: 'check', for: id }, cb, h('span', null, h('b', null, 'Let people find it and ask to join. '),
+      h('span', { class: 'muted' }, 'Its name, description and member count show in Browse groups. Messages stay encrypted. You or a group admin approve each request.'))) };
+  }
+
+  function newGroupDialog(preset = {}) {
     const err = h('div', { class: 'form-error hidden', role: 'alert' });
-    const name = h('input', { class: 'input', id: 'ng-name', maxlength: 60, placeholder: 'e.g. Warehouse team' });
+    const name = h('input', { class: 'input', id: 'ng-name', maxlength: 60, placeholder: 'e.g. Warehouse team', value: preset.name || '' });
+    const listed = listedCheck('ng-listed', false);
     const ok = h('button', { class: 'btn btn-primary', disabled: true }, 'Create group');
     const count = h('div', { class: 'hint' }, `Pick up to ${Y.MAX_GROUP - 1} people.`);
     let picked = new Set();
@@ -1347,14 +1433,17 @@
     const pp = peoplePicker({ multi: true, max: Y.MAX_GROUP - 1, onChange: set => { picked = set; update(); } });
     name.addEventListener('input', update);
     ok.addEventListener('click', () => UI.busy(ok, null, async () => {
-      const ch = await Y.createGroup({ name: name.value, userIds: Array.from(pp.picked) });
+      const ch = await Y.createGroup({ name: name.value, userIds: Array.from(pp.picked), listed: listed.cb.checked });
       m.close(); Chat.open(ch.id);
     }, err));
     const m = UI.modal({ title: 'Create a group chat', cls: 'mid', body: [err,
       h('div', { class: 'field' }, h('label', { for: 'ng-name' }, 'Group name'), name),
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Members'), count), pp.el,
-      h('div', { class: 'note note-ok', style: { marginTop: '6px' } }, icon('lock'), h('div', null, 'End-to-end encrypted, including the group name. Only members can read it. Messages and files delete after 7 days.'))],
+      listed.el,
+      h('div', { class: 'note note-ok', style: { marginTop: '6px' } }, icon('lock'), h('div', null, 'End-to-end encrypted, including the group name. Only members can read it. Messages and files delete after 7 days. ',
+        h('button', { class: 'link-btn', type: 'button', onclick: () => privacyDialog('group') }, 'How is this protected?')))],
     foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+    if (preset.userIds) pp.add(preset.userIds);
     name.focus();
   }
 
@@ -1363,7 +1452,7 @@
     const users = ids.map(id => A.users.get(id)).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
     UI.modal({ title: `Members of ${chName(ch)} (${users.length})`, body: h('div', { class: 'people-list' }, users.map(u => {
       const p = Y.presenceOf(u.id);
-      return h('div', { class: 'person', onclick: () => { UI.closeAll(); Chat.openUser(u.id); } }, UI.avatar(u, 32),
+      return h('div', { class: 'person', onclick: () => profileDialog(u.id) }, UI.avatar(u, 32),
         h('div', null, h('div', { class: 'nm' }, u.name + (u.id === meId() ? ' (you)' : '')), h('div', { class: 'sub row', style: { gap: '6px' } }, UI.dot(p.state), UI.stateLabel(p.state) + (p.statusText ? ' · ' + p.statusText : ''))),
         A.roleLabel(u.id) ? h('span', { class: 'pill grey', style: { marginLeft: 'auto' } }, A.roleLabel(u.id)) : null);
     })) });
@@ -1376,7 +1465,9 @@
     UI.popover(anchor, [
       h('div', { class: 'menu-head' }, UI.avatar(u, 48), h('div', null, h('div', { class: 'nm' }, u.name),
         h('div', { class: 'muted row', style: { gap: '6px', fontSize: '13px' } }, UI.dot(p.state), UI.stateLabel(p.state)),
-        p.statusText ? h('div', { style: { fontSize: '13px' } }, p.statusText) : null)),
+        p.statusText ? h('div', { style: { fontSize: '13px' } }, p.statusText) : null,
+        u.title ? h('div', { class: 'muted', style: { fontSize: '13px' } }, u.title) : null)),
+      h('button', { class: 'menu-item', onclick: () => { UI.closePopover(); profileDialog(userId); } }, icon('info'), 'View full profile'),
       userId !== meId() ? h('button', { class: 'menu-item', onclick: () => { UI.closePopover(); Chat.openUser(userId); } }, icon('message'), 'Send a direct message') : null,
     ], { label: u.name + ' profile' });
   }
@@ -1439,7 +1530,15 @@
           if (v != null) { m.close(); UI.toast('Group renamed', 'ok'); }
         } }, icon('edit'), ch.groupName ? 'Rename' : 'Give it a name'),
         h('button', { class: 'btn', disabled: Y.members(ch).length >= Y.MAX_GROUP, title: Y.members(ch).length >= Y.MAX_GROUP ? `Groups can have up to ${Y.MAX_GROUP} people` : null,
-          onclick: () => { m.close(); addMembersDialog(ch); } }, icon('plus'), 'Add people')));
+          onclick: () => { m.close(); addMembersDialog(ch); } }, icon('plus'), 'Add people'),
+        ch.groupName ? h('button', { class: 'btn', title: 'Show it in Browse groups so people can ask to join', onclick: async () => {
+          const on = !ch.meta.listed;
+          if (on && !(await UI.confirm({ title: 'List it in Browse groups?', ok: 'List it',
+            text: 'Everyone in the workspace will see its name, description and member count, and can ask to join. You or a group admin approve each request. Messages stay encrypted.' }))) return;
+          try { await Y.updateGroup(ch, { listed: on }); m.close(); UI.toast(on ? 'Listed in Browse groups' : 'Removed from Browse groups', 'ok'); } catch (e) { UI.toast(e.message, 'error'); }
+        } }, icon('search'), ch.meta.listed ? 'Unlist from Browse groups' : 'List in Browse groups') : null));
+      else if (ch.kind === 'group' && Y.members(ch).length < Y.MAX_GROUP) body.push(h('div', { class: 'row', style: { flexWrap: 'wrap', marginBottom: '14px' } },
+        h('button', { class: 'btn', title: 'Ask a group admin to add someone', onclick: () => { m.close(); suggestMemberDialog(ch); } }, icon('plus'), 'Suggest someone')));
       body.push(h('div', { class: 'note note-ok', style: { marginTop: 0, marginBottom: '14px' } }, icon('lock'),
         h('div', null, h('b', null, 'End-to-end encrypted. '), 'Messages and files are encrypted on this PC before they reach the shared drive. Only the people here can read them, not even the admin. ' + (Y.isPrivateChannel(ch) ? 'History is kept, like any channel.' : 'Everything is deleted 7 days after it was sent.'))));
       const creator = Y.isGroupCreator(ch);
@@ -1571,11 +1670,13 @@
       h('div', { class: 'menu-head' }, UI.avatar(me, 40), h('div', null, h('div', { class: 'nm' }, me.name),
         h('div', { class: 'muted row', style: { gap: '6px', fontSize: '13px' } }, UI.dot(p.state), p.statusText || UI.stateLabel(p.state)))),
       item('status', p.statusText ? 'Change status' : 'Set a status', statusDialog),
+      item('info', 'View my profile', () => profileDialog(meId())),
       item('edit', 'Edit profile', editProfileDialog),
       h('div', { class: 'menu-sep' }),
       h('div', { class: 'menu-label' }, 'Theme'),
       h('div', { class: 'seg' }, seg('system', 'System', 'monitor'), seg('light', 'Light', 'sun'), seg('dark', 'Dark', 'moon')),
       notif === 'granted' ? null : item('bell', notif === 'denied' ? 'Desktop notifications are blocked' : 'Turn on desktop notifications', () => SC.app.requestNotifications()),
+      item(N.isQuiet() ? 'bellOff' : 'bell', N.isQuiet() ? `Do not disturb until ${U.formatDateTime(N.dndUntil())}` : 'Notification settings', notifSettingsDialog),
       item('volume', SC.app.soundOn() ? 'Sound: on' : 'Sound: off', () => { SC.app.setSound(!SC.app.soundOn()); UI.toast(SC.app.soundOn() ? 'Sound on' : 'Sound off'); }),
       item('check', Y.receiptsOn() ? 'Read receipts: on' : 'Read receipts: off', () => {
         Y.setReceipts(!Y.receiptsOn());
@@ -1583,7 +1684,9 @@
       }),
       h('div', { class: 'menu-sep' }),
       item('key', 'Change password', changePasswordDialog),
-      A.isOwner() ? item('key', 'Security question', recoveryDialog) : null,
+      item('key', 'Security question', recoveryDialog),
+      item('shield', 'Privacy and security: who can read what', () => privacyDialog()),
+      item('megaphone', 'What’s new', () => whatsNewDialog()),
       A.isAdmin() ? item('info', 'Admin guide: what you can do', adminGuide) : null,
       A.isAdmin() ? item('shield', 'Admin settings', adminDialog) : null,
       item('lock', 'Lock (sign out)', () => SC.app.lock()),
@@ -1601,6 +1704,12 @@
     const state = { animal: me.animal, color: A.avatarColor(me.color) };
     const err = h('div', { class: 'form-error hidden', role: 'alert' });
     const name = h('input', { class: 'input', id: 'ep-name', value: me.name, maxlength: 32 });
+    const realName = h('input', { class: 'input', id: 'ep-real', maxlength: 60, placeholder: 'e.g. Maria Santos', autocomplete: 'name' });
+    let realLoaded = '';
+    A.realNameOf(meId()).then(n => { realLoaded = n; if (!realName.value) realName.value = n; });
+    const jobTitle = h('input', { class: 'input', id: 'ep-title', value: me.title || '', maxlength: 60, placeholder: 'e.g. Pickup coordinator' });
+    const about = h('textarea', { class: 'input', id: 'ep-about', rows: 3, maxlength: 300, placeholder: 'A line about you, your shift or how to reach you' });
+    about.value = me.about || '';
     const pv = h('span');
     const draw = () => UI.set(pv, UI.avatar(state, 56));
     const animals = h('div', { class: 'animal-grid', role: 'radiogroup', 'aria-label': 'Avatar' }, A.ANIMALS.map(([e, n]) => h('button', { type: 'button', role: 'radio', 'aria-checked': String(e === state.animal), 'aria-label': n, title: n,
@@ -1609,9 +1718,19 @@
       onclick: ev => { state.color = c; colors.querySelectorAll('button').forEach(x => x.setAttribute('aria-checked', String(x === ev.currentTarget))); draw(); } })));
     draw();
     const ok = h('button', { class: 'btn btn-primary' }, 'Save');
-    ok.addEventListener('click', () => UI.busy(ok, null, async () => { await A.updateProfile({ name: name.value, animal: state.animal, color: state.color }); m.close(); UI.toast('Profile updated', 'ok'); }, err));
+    ok.addEventListener('click', () => UI.busy(ok, null, async () => {
+      const rn = A.cleanRealName(realName.value);
+      // re-seal only when it changed (or was never readable here), so an unchanged name doesn't rewrite every seal
+      await A.updateProfile({ name: name.value, animal: state.animal, color: state.color, title: jobTitle.value, about: about.value,
+        realName: rn !== realLoaded || !realLoaded ? rn : undefined });
+      m.close(); UI.toast('Profile updated', 'ok');
+    }, err));
     const m = UI.modal({ title: 'Edit profile', cls: 'mid', body: [err, h('div', { class: 'preview' }, pv, h('div', { class: 'name' }, 'Preview')),
       h('div', { class: 'field' }, h('label', { for: 'ep-name' }, 'Display name'), name),
+      h('div', { class: 'field' }, h('label', { for: 'ep-real' }, 'Real name (required)'), realName,
+        h('div', { class: 'hint row', style: { gap: '6px' } }, icon('lock'), 'Only admins and the super admin can see it. It’s encrypted for them; everyone else sees your display name.')),
+      h('div', { class: 'field' }, h('label', { for: 'ep-title' }, 'Job title (optional)'), jobTitle),
+      h('div', { class: 'field' }, h('label', { for: 'ep-about' }, 'About (optional)'), about, h('div', { class: 'hint' }, 'Shown on your profile. Everyone in the workspace can see it.')),
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Group'),
         h('div', { class: 'row', style: { gap: '10px' } },
           h('span', null, A.teamName(A.teamOf(meId())) || 'None yet'),
@@ -1653,7 +1772,10 @@
       m.close(); UI.toast('Security question saved', 'ok');
     }, err));
     const m = UI.modal({ title: 'Security question', body: [err,
-      h('p', { class: 'muted', style: { fontSize: '13px' } }, current ? 'If you forget your password, answering this on the sign-in screen lets you choose a new one.' : 'No security question is set. Without one, a forgotten super admin password can’t be recovered.'),
+      h('p', { class: 'muted', style: { fontSize: '13px' } }, current
+        ? 'If you forget your password, click “Forgot password?” on the sign-in screen and answer this to choose a new one. You keep all your messages.'
+        : A.isOwner() ? 'No security question is set. Without one, a forgotten super admin password can’t be recovered.'
+          : 'No security question is set. If you forget your password, an admin can only reset it, and your direct messages from before the reset can’t be opened.'),
       h('div', { class: 'field' }, h('label', { for: 'rq-cur' }, 'Current password'), cur),
       h('div', { class: 'field' }, h('label', { for: 'rq-q' }, 'Question'), q),
       h('div', { class: 'field' }, h('label', { for: 'rq-a' }, current ? 'New answer' : 'Answer'), a,
@@ -1730,14 +1852,15 @@
   /* ---- announcements ----
    * Announcements have their own channel (sidebar → Announcements), with the reserved id ANN. New ones also
    * pop up on top of whatever is open; closing the pop-up counts as seen, and it stays in the channel. */
-  function openAnnouncements() {
+  function openAnnouncements(feed = '') {
+    if (!annFeeds().includes(feed)) feed = '';
     if (el.ta && st.openId) st.drafts[st.openId] = el.ta.value;
-    st.openId = ANN;
+    st.openId = annKey(feed);
     Y.openId = null;
-    U.ls.set('lastOpen.' + A.ws.id, ANN);
+    U.ls.set('lastOpen.' + A.ws.id, st.openId);
     st.editingId = null;
     st.firstRender = true;
-    st.annFresh = new Set(Y.pendingAnnouncements().map(a => a.id));
+    st.annFresh = new Set(feedPending(feed).map(a => a.id));
     el.root.classList.remove('side-open');
     UI.closePopover();
     renderSidebar(); renderHeader(); renderKeyNotice(); buildComposer(); renderMessages(); renderPins();
@@ -1751,11 +1874,13 @@
     const keepTop = box.scrollTop;
     const openReach = new Set(Array.from(box.querySelectorAll('details[open]')).map(d => d.closest('[data-ann]')).filter(Boolean).map(r => r.dataset.ann));
     if (!st.annFresh) st.annFresh = new Set();
-    Y.pendingAnnouncements().forEach(a => st.annFresh.add(a.id)); // keep "new" highlighted after it's marked seen
-    const items = Y.announcementList().slice().reverse(); // oldest first, like a chat
+    feedPending(annFeed()).forEach(a => st.annFresh.add(a.id)); // keep "new" highlighted after it's marked seen
+    const feed = annFeed();
+    const items = Y.announcementList().filter(a => feedOf(a) === feed).reverse(); // oldest first, like a chat
     const frag = document.createDocumentFragment();
-    frag.appendChild(h('div', { class: 'intro' }, h('h3', null, 'Announcements'),
-      h('p', null, `Messages from the admins to everyone in ${A.ws.name}. Each one stays here for a year.`)));
+    frag.appendChild(h('div', { class: 'intro' }, h('h3', null, feedName(feed)),
+      h('p', null, feed ? `Private announcements for ${A.teamName(feed)}. Only people in the group can read them: they’re encrypted for each of them. Each one stays here for a year.`
+        : `Messages from the admins to everyone in ${A.ws.name}. Each one stays here for a year.`)));
     if (!items.length) frag.appendChild(h('div', { class: 'ann-empty' }, 'No announcements yet.'));
     let lastDay = '', divDone = false;
     for (const a of items) {
@@ -1773,19 +1898,22 @@
           h('summary', null, `Seen by ${r.seen.length} of ${r.audience.length}`),
           h('div', { class: 'muted', style: { fontSize: '13px', marginTop: '4px' } }, missing.length ? 'Not seen yet: ' + missing.map(x => x.name).sort().join(', ') : 'Everyone has seen it.'));
       }
-      frag.appendChild(h('div', { class: 'msg theirs ann-msg' + (fresh ? ' ann-new' : ''), 'data-ann': a.id },
-        h('div', { class: 'msg-gutter' }, UI.avatar(u, 40)),
+      frag.appendChild(h('div', { class: 'msg theirs ann-msg' + (fresh ? ' ann-new' : ''), 'data-ann': a.id, tabindex: admin ? '0' : null },
+        h('div', { class: 'msg-gutter' }, h('button', { class: 'avatar-btn', 'data-action': 'profile', 'aria-label': `${A.name(a.userId)}: view profile`, title: 'View profile' }, UI.avatar(u, 40))),
         h('div', { class: 'msg-main' },
-          h('div', { class: 'msg-head' }, h('span', { class: 'msg-name' }, A.name(a.userId)),
+          h('div', { class: 'msg-head' }, h('button', { class: 'msg-name', 'data-action': 'profile' }, A.name(a.userId)),
             role ? h('span', { class: 'pill grey' }, role) : null,
             a.to ? h('span', { class: 'pill', title: a.to.filter(x => x !== a.userId).map(A.name).sort().join(', ') }, icon('lock'), `Private · ${a.to.filter(x => x !== a.userId).length} people`) : null,
-            h('span', { class: 'msg-time', title: new Date(a.ts).toLocaleString() }, U.formatTime(a.ts))),
+            h('span', { class: 'msg-time', title: new Date(a.ts).toLocaleString() }, U.formatTime(a.ts)),
+            a.editTs ? h('span', { class: 'msg-time', title: 'Edited ' + new Date(a.editTs).toLocaleString() }, '(edited)') : null),
           h('div', { class: 'ann-card' },
             a.title ? h('div', { class: 'ann-title' }, a.title) : null,
             h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, []) }),
-            reach)),
-        admin ? h('div', { class: 'msg-tools', role: 'toolbar', 'aria-label': 'Announcement actions' },
-          h('button', { class: 'icon-btn', 'data-action': 'ann-withdraw', 'aria-label': 'Withdraw announcement', title: 'Withdraw (removes it for everyone)' }, icon('trash'))) : null));
+            reach,
+            // shown on hover (and keyboard focus) at the card's corner, like the tools on chat messages
+            admin ? h('div', { class: 'msg-tools ann-tools', role: 'toolbar', 'aria-label': 'Announcement actions' },
+              Y.canEditAnnouncement(a) ? h('button', { class: 'icon-btn', 'data-action': 'ann-edit', 'aria-label': 'Edit announcement', title: 'Edit (fix a mistake; it doesn’t pop up again)' }, icon('edit')) : null,
+              h('button', { class: 'icon-btn', 'data-action': 'ann-withdraw', 'aria-label': 'Delete announcement', title: 'Delete for everyone' }, icon('trash'))) : null))));
     }
     UI.set(box, frag);
     if (st.firstRender || atBottom) {
@@ -1799,22 +1927,28 @@
   /** Viewing the channel counts as having seen everything in it. */
   function ackVisibleAnnouncements() {
     if (!isAnn() || document.visibilityState !== 'visible' || !document.hasFocus()) return;
-    for (const a of Y.pendingAnnouncements()) Y.ackAnnouncement(a.id);
+    for (const a of feedPending(annFeed())) Y.ackAnnouncement(a.id);
   }
 
   async function onAnnClick(t) {
     const row = t.closest('[data-ann]');
-    if (!row || t.dataset.action !== 'ann-withdraw' || !A.isAdmin()) return;
-    if (!(await UI.confirm({ title: 'Withdraw this announcement?', text: 'It disappears for everyone, including people who haven’t seen it yet.', ok: 'Withdraw', danger: true }))) return;
-    try { await Y.withdrawAnnouncement(row.dataset.ann); UI.toast('Announcement withdrawn', 'ok'); } catch (e) { UI.toast(e.message, 'error'); }
+    if (!row) return;
+    if (t.dataset.action === 'profile') { const a = Y.announcements.get(row.dataset.ann); if (a) profileCard(a.userId, t); return; }
+    if (!A.isAdmin()) return;
+    if (t.dataset.action === 'ann-edit') return editAnnouncementDialog(Y.announcements.get(row.dataset.ann));
+    if (t.dataset.action !== 'ann-withdraw') return;
+    if (!(await UI.confirm({ title: 'Delete this announcement?', text: 'It disappears for everyone, including people who haven’t seen it yet. This can’t be undone.', ok: 'Delete', danger: true }))) return;
+    try { await Y.withdrawAnnouncement(row.dataset.ann); UI.toast('Announcement deleted', 'ok'); } catch (e) { UI.toast(e.message, 'error'); }
   }
 
   /** Pop up the oldest announcement I haven't seen yet, one at a time, over whatever is open.
    *  Closing it (Close, ×, Esc or clicking outside) marks it as seen; it stays in the Announcements channel. */
   function showPendingAnnouncement() {
     if (st.annOpen || !el.root) return;
-    if (isAnn() && document.visibilityState === 'visible' && document.hasFocus()) { schedule('msgs'); return; }
-    const pending = Y.pendingAnnouncements();
+    // the feed I'm looking at marks its own as seen; the others still pop up
+    const viewing = isAnn() && document.visibilityState === 'visible' && document.hasFocus();
+    if (viewing) schedule('msgs');
+    const pending = Y.pendingAnnouncements().filter(a => !(viewing && feedOf(a) === annFeed()));
     const a = pending[0];
     if (!a) return;
     st.annOpen = true;
@@ -1825,15 +1959,15 @@
       h('div', { class: 'row', style: { gap: '10px', marginBottom: '12px' } }, UI.avatar(u, 32),
         h('div', null, h('div', { style: { fontWeight: '600' } }, A.name(a.userId)), h('div', { class: 'muted', style: { fontSize: '13px' } }, (A.roleLabel(a.userId) || 'Admin') + ' · ' + U.formatDateTime(a.ts) + (a.to ? ' · sent privately to you' + (a.to.length > 2 ? ` and ${a.to.length - 2} others` : '') : '')))),
       h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, []) }),
-      h('p', { class: 'ann-later' }, icon('megaphone'), 'You can read this again any time in Announcements, at the top of the sidebar.' + (more ? ` ${more} more after this one.` : ''))],
+      h('p', { class: 'ann-later' }, icon('megaphone'), `You can read this again any time in ${feedName(feedOf(a))}, at the top of the sidebar.` + (more ? ` ${more} more after this one.` : ''))],
     foot: [
-      h('button', { class: 'btn', onclick: () => { goView = true; m.close(); } }, 'View all announcements'),
+      h('button', { class: 'btn', onclick: () => { goView = true; m.close(); } }, feedOf(a) ? `Open ${feedName(feedOf(a))}` : 'View all announcements'),
       h('button', { class: 'btn btn-primary', onclick: () => m.close() }, icon('x'), 'Close')],
     onClose: () => {
       if (!st.unmounting) Y.ackAnnouncement(a.id);
       st.annOpen = false;
       if (st.unmounting) return;
-      if (goView) Chat.open(ANN); else setTimeout(showPendingAnnouncement, 300);
+      if (goView) Chat.open(annKey(feedOf(a))); else setTimeout(showPendingAnnouncement, 300);
     } });
     SC.app.notify({ title: 'Announcement: ' + (a.title || A.name(a.userId)), body: a.text.slice(0, 140), tag: 'ann-' + a.id });
   }
@@ -1874,34 +2008,69 @@
 
   /** Everyone, or privately to chosen people. "Add everyone in…" fills the list from a private channel or group,
    *  so an existing team can be the audience without keeping separate lists. */
-  function newAnnouncementDialog() {
+  function newAnnouncementDialog(preset = {}) {
+    let label = ''; // which group the list came from, for the super admin's activity feed
     const err = h('div', { class: 'form-error hidden', role: 'alert' });
     const title = h('input', { class: 'input', id: 'an-title', maxlength: 120, placeholder: 'e.g. Office closed on Friday' });
     const text = h('textarea', { class: 'input', id: 'an-text', rows: 6, maxlength: String(Y.MAX_TEXT), placeholder: 'What do people need to know?' });
     let priv = false;
     const ok = h('button', { class: 'btn btn-primary' }, icon('megaphone'));
-    const all = A.activeUsers().filter(u => u.id !== meId()).length;
+    // admins can only send private announcements inside their own group; the super admin to anyone
+    const scope = Y.announceTeam();
+    const allowed = id => Y.canAnnounceTo(id);
+    const all = A.activeUsers().filter(u => u.id !== meId() && allowed(u.id)).length;
     const count = h('div', { class: 'hint' });
+    // "Send to": group chips stay selected (and show who they add); people can also be ticked one by one below
+    const teams = A.teamList().filter(t => scope === null || t.id === scope);
+    const sources = teams.map(t => ({ key: 'team:' + t.id, name: t.name, team: true,
+      ids: () => A.teamMembers(t.id).map(u => u.id).filter(id => id !== meId()),
+      waiting: () => A.teamPending().filter(u => A.teamRequest(u.id) === t.id && u.id !== meId()).length }))
+      .concat(Array.from(Y.chans.values()).filter(c => c.kind === 'group' && c.groupName && Y.members(c).some(id => id !== meId() && allowed(id)))
+        .sort((a, b) => chName(a).localeCompare(chName(b)))
+        .map(c => ({ key: c.id, name: chName(c), ids: () => Y.members(c).filter(id => id !== meId() && allowed(id)), waiting: () => 0 })));
+    const scopeNote = scope === null ? null : h('div', { class: 'note note-info', style: { marginBottom: '10px' } }, icon('lock'), h('div', null, scope
+      ? [h('b', null, `Only ${A.teamName(scope)}. `), `As an admin of ${A.teamName(scope)}, you can send private announcements to people in your group only. Ask the super admin to reach the other group.`]
+      : [h('b', null, 'You don’t have a group yet. '), 'Private announcements go to people in your own group, so you can only post to everyone for now.']));
+    const chosen = new Set();
+    const chips = h('div', { class: 'sendto-chips', role: 'group', 'aria-label': 'Send to everyone in a group' });
+    const sendto = h('div', { class: 'hint sendto' });
+    const drawChips = () => {
+      UI.set(chips, sources.map((s, i) => {
+        const n = s.ids().length, on = chosen.has(s.key);
+        return [i === teams.length && i > 0 ? h('span', { class: 'chip-sep', 'aria-hidden': 'true' }) : null, h('button', { type: 'button', class: 'chip' + (on ? ' on' : ''), 'aria-pressed': String(on), disabled: !n && !on,
+          title: n ? (on ? 'Click to remove these people' : `Add everyone in ${s.name}`) : (s.waiting() ? `Nobody is accepted into ${s.name} yet (${s.waiting()} waiting)` : `Nobody else is in ${s.name}`),
+          onclick: () => toggleSource(s) }, s.team ? icon('users') : null, `${s.name} · ${n}`, on ? icon('check') : null)];
+      }));
+      const parts = sources.filter(s => chosen.has(s.key));
+      const waiting = parts.reduce((t, s) => t + s.waiting(), 0);
+      UI.set(sendto, parts.length ? `Includes everyone in ${parts.map(s => s.name).join(', ')}.` : 'Pick a group, or tick people below.',
+        waiting ? h('span', { class: 'sendto-warn' }, ` ${waiting} ${waiting === 1 ? 'person is' : 'people are'} still waiting for an admin to accept their group and won’t get it.`) : null);
+    };
+    function toggleSource(s) {
+      if (chosen.has(s.key)) {
+        chosen.delete(s.key);
+        const keep = new Set(sources.filter(x => chosen.has(x.key)).flatMap(x => x.ids()));
+        pp.remove(s.ids().filter(id => !keep.has(id)));
+      } else {
+        chosen.add(s.key);
+        const ids = s.ids();
+        if (!ids.length) UI.toast(`Nobody else is in ${s.name} yet.`);
+        pp.add(ids);
+      }
+      label = sources.filter(x => chosen.has(x.key)).map(x => x.name).join(', ').slice(0, 80);
+      drawChips();
+    }
     const update = () => {
       ok.lastChild && ok.lastChild.nodeType === 3 ? ok.lastChild.remove() : null;
       ok.appendChild(document.createTextNode(priv ? `Send to ${pp.picked.size} ${pp.picked.size === 1 ? 'person' : 'people'}` : 'Post to everyone'));
       ok.disabled = priv && !pp.picked.size;
-      count.textContent = pp.picked.size ? `${pp.picked.size} chosen` : 'Nobody chosen yet.';
+      count.textContent = pp.picked.size ? `${pp.picked.size} ${pp.picked.size === 1 ? 'person' : 'people'} chosen` : 'Nobody chosen yet.';
     };
-    const pp = peoplePicker({ multi: true, max: all, onChange: update });
+    const pp = peoplePicker({ multi: true, max: Math.max(all, 1), onChange: update, only: allowed });
     pp.el[0].removeAttribute('autofocus');
-    const teams = Array.from(Y.chans.values()).filter(c => c.kind === 'group' && c.groupName).sort((a, b) => chName(a).localeCompare(chName(b)));
-    const fromTeam = h('select', { class: 'select', 'aria-label': 'Add everyone in a channel or group' },
-      h('option', { value: '' }, 'Group name'),
-      h('optgroup', { label: 'Groups' }, A.teamList().map(t => h('option', { value: 'team:' + t.id }, `${t.name} (${A.teamMembers(t.id).length})`))),
-      teams.length ? h('optgroup', { label: 'Private channels and group chats' }, teams.map(c => h('option', { value: c.id }, `${chName(c)} (${Y.members(c).length})`))) : null);
-    fromTeam.addEventListener('change', () => {
-      const v = fromTeam.value;
-      if (v.startsWith('team:')) pp.add(A.teamMembers(v.slice(5)).map(u => u.id));
-      else { const c = Y.chans.get(v); if (c) pp.add(Y.members(c)); }
-      fromTeam.value = '';
-    });
-    const people = h('div', { class: 'field hidden' }, h('span', { class: 'label' }, 'Send to'), h('div', { class: 'row', style: { gap: '8px', marginBottom: '6px' } }, fromTeam, count), pp.el);
+    drawChips();
+    const people = h('div', { class: 'field hidden' }, scopeNote, h('span', { class: 'label' }, 'Send to'), chips, sendto,
+      h('div', { class: 'row', style: { justifyContent: 'space-between', margin: '10px 0 2px' } }, h('span', { class: 'label', style: { margin: 0 } }, 'People'), count), pp.el);
     const hint = h('div', { class: 'hint' });
     const seg = h('div', { class: 'vis-seg', role: 'radiogroup', 'aria-label': 'Who gets it' });
     const drawSeg = () => {
@@ -1909,16 +2078,20 @@
         h('button', { type: 'button', role: 'radio', 'aria-checked': String(priv === (v === 'private')), onclick: () => { priv = v === 'private'; drawSeg(); } },
           icon(ic), h('span', null, h('b', null, t), h('span', { class: 'sub' }, sub)))));
       people.classList.toggle('hidden', !priv);
-      hint.textContent = priv
-        ? 'Only the people chosen get the pop-up and can read it; it’s encrypted for them. It stays in their Announcements for a year.'
-        : 'Everyone sees it in a pop-up within a few seconds, and it stays in Announcements for a year. It isn’t encrypted: anyone with access to the shared drive can read it.';
+      UI.set(hint, priv
+        ? 'Only the people chosen get the pop-up and can read it; it’s encrypted for them, so nobody else can read it, not even other admins. It stays in their Announcements for a year. '
+        : 'Everyone sees it in a pop-up within a few seconds, and it stays in Announcements for a year. It isn’t encrypted: anyone with access to the shared drive can read it. ',
+      h('button', { class: 'link-btn', type: 'button', onclick: () => privacyDialog('announcements') }, 'Who can read it?'));
       update();
     };
     drawSeg();
+    if (preset.team) { priv = true; drawSeg(); const s = sources.find(x => x.key === 'team:' + preset.team); if (s) toggleSource(s); }
     ok.addEventListener('click', () => UI.busy(ok, null, async () => {
       const n = pp.picked.size;
-      await Y.postAnnouncement({ title: title.value, text: text.value, to: priv ? Array.from(pp.picked) : undefined });
-      m.close(); UI.toast(priv ? `Announcement sent to ${n} ${n === 1 ? 'person' : 'people'}` : 'Announcement posted', 'ok');
+      const id = await Y.postAnnouncement({ title: title.value, text: text.value, to: priv ? Array.from(pp.picked) : undefined, label });
+      const f = feedOf(Y.announcements.get(id));
+      m.close(); UI.toast(priv ? `Announcement sent to ${n} ${n === 1 ? 'person' : 'people'}` + (f ? ` · in ${feedName(f)}` : '') : 'Announcement posted', 'ok');
+      if (isAnn() && annFeed() !== f) Chat.open(annKey(f));
     }, err));
     const m = UI.modal({ title: 'New announcement', cls: 'mid', body: [err,
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Who gets it'), seg),
@@ -1931,7 +2104,16 @@
 
   /* ---- my group ---- */
   /** Pick or type my group. Mandatory once for profiles made before groups existed (can't be dismissed). */
+  /** Anyone without a group (accepted or waiting) must pick one before using the app. Checked at start-up and
+   *  whenever profiles or the workspace change, so people who were already signed in are asked too. */
+  function askTeamIfNeeded() {
+    if (!el.root || !A.me || !A.needsTeam() || st.teamAsk) return false;
+    chooseTeamDialog({ mandatory: true });
+    return true;
+  }
+
   function chooseTeamDialog({ mandatory }) {
+    if (mandatory) st.teamAsk = true;
     const err = h('div', { class: 'form-error hidden', role: 'alert' });
     const tf = UI.teamInput('my-team', A.teamOf(meId()) || A.teamRequest(meId()) || '');
     let saved = false;
@@ -1949,7 +2131,67 @@
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Group'), tf.el),
       A.isAdmin() ? null : h('div', { class: 'note note-info' }, icon('shield'), h('div', null, h('b', null, 'Choose carefully: you can’t change it later. '), 'Only an admin can. An admin checks it first; until they accept it, messages meant only for that group won’t reach you.'))],
     foot: mandatory ? [ok] : [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok],
-    onClose: () => { if (mandatory && !saved && A.needsTeam() && el.root && !st.unmounting) setTimeout(() => chooseTeamDialog({ mandatory: true }), 0); } });
+    onClose: () => {
+      if (mandatory && !saved && A.needsTeam() && el.root && !st.unmounting) { setTimeout(() => chooseTeamDialog({ mandatory: true }), 0); return; }
+      if (mandatory) { st.teamAsk = false; if (saved && el.root) askSetupIfNeeded().then(shown => { if (!shown && el.root) showWhatsNew(); }); }
+    } });
+  }
+
+  /* ---- mandatory: real name + security question ----
+   * Every profile needs both. Profiles made before this (or after an admin reset, which clears the question and
+   * leaves the real name sealed to the old keys) are asked once after sign-in; the dialog can't be dismissed. */
+  async function askSetupIfNeeded() {
+    if (!el.root || !A.me || st.setupAsk || st.teamAsk) return false;
+    st.setupAsk = true; // reserve while checking, so two callers can't open it twice
+    let needQ = false, needName = false;
+    try {
+      [needQ, needName] = await Promise.all([A.hasRecovery(meId()).then(x => !x), A.hasRealName().then(x => !x)]);
+    } catch { /* can't read the share right now: ask next time */ }
+    if (!el.root || (!needQ && !needName)) { st.setupAsk = false; return false; }
+    setupDialog(needQ, needName);
+    return true;
+  }
+
+  function setupDialog(needQ, needName) {
+    st.setupAsk = true;
+    const err = h('div', { class: 'form-error hidden', role: 'alert' });
+    const real = h('input', { class: 'input', id: 'su-real', maxlength: 60, autocomplete: 'name', placeholder: 'e.g. Maria Santos' });
+    const cur = h('input', { class: 'input', type: 'password', id: 'su-cur', autocomplete: 'current-password' });
+    const q = h('input', { class: 'input', id: 'su-q', maxlength: 120, autocomplete: 'off', placeholder: 'e.g. What was the name of my first manager?' });
+    const a = h('input', { class: 'input', type: 'password', id: 'su-a', autocomplete: 'off' });
+    let saved = false;
+    const ok = h('button', { class: 'btn btn-primary' }, 'Save and continue');
+    ok.addEventListener('click', () => UI.busy(ok, 'Saving…', async () => {
+      // check everything first, so nothing is half-saved
+      const rn = needName ? A.validateRealName(real.value) : null;
+      if (needQ) {
+        A.validateRecovery(q.value, a.value);
+        try { await A.setRecovery(cur.value, q.value, a.value); } catch (e) { if (e.code === 'BAD_PASSWORD') throw new Error('Your password isn’t right.'); throw e; }
+        needQ = false;
+      }
+      if (rn) { const me = A.users.get(meId()); await A.updateProfile({ name: me.name, animal: me.animal, color: me.color, realName: rn }); needName = false; }
+      saved = true; m.close(); UI.toast('Profile complete. Thanks!', 'ok');
+    }, err));
+    const m = UI.modal({ title: 'Finish your profile', cls: 'mid must', body: [err,
+      h('p', { class: 'muted', style: { fontSize: '14px', marginTop: 0 } }, 'Every profile now needs ' +
+        (needQ && needName ? 'a real name and a security question' : needName ? 'a real name' : 'a security question') + '. This takes a minute and you only do it once.'),
+      needName ? h('div', { class: 'field' }, h('label', { for: 'su-real' }, 'Real name'), real,
+        h('div', { class: 'hint row', style: { gap: '6px' } }, icon('lock'), 'Only admins and the super admin can see it. Everyone else sees your display name.')) : null,
+      needQ ? [
+        h('div', { class: 'note note-info', style: { marginBottom: '14px' } }, icon('key'), h('div', null, h('b', null, 'Your security question is a second password. '),
+          'If you forget your password, “Forgot password?” on the sign-in screen and this answer get you back in with all your messages and work. Admins can’t use it.')),
+        h('div', { class: 'field' }, h('label', { for: 'su-cur' }, 'Your password'), cur),
+        h('div', { class: 'field' }, h('label', { for: 'su-q' }, 'Security question'), q),
+        h('div', { class: 'field' }, h('label', { for: 'su-a' }, 'Answer'), a,
+          h('div', { class: 'hint' }, `At least ${A.MIN_ANSWER} characters. Capitals and extra spaces don’t matter. Pick something coworkers couldn’t guess or look up.`)),
+      ] : null],
+    foot: [h('button', { class: 'btn', onclick: () => SC.app.lock() }, 'Sign out'), ok],
+    onClose: () => {
+      if (!saved && el.root && !st.unmounting && A.me) { setTimeout(() => setupDialog(needQ, needName), 0); return; }
+      st.setupAsk = false;
+      if (saved && el.root) showWhatsNew();
+    } });
+    setTimeout(() => (needName ? real : cur).focus(), 0);
   }
 
   /* ---- admin guide ---- */
@@ -2086,18 +2328,38 @@
         if (typeof p.name === 'string') return `renamed ${label} to #${p.name}`;
         return `edited the description of ${label}`;
       };
-      const list = Array.from(A.adminLog.values()).sort((a, b) => b.ts - a.ts).slice(0, 200);
+      // the super admin also sees admins' private channels, group chats and private announcements (audit records)
+      const audits = owner ? Array.from(A.auditLog.values()).map(a => ({ ts: a.ts, userId: a.userId, valid: true,
+        text: N.describe({ type: 'aud', kind: a.kind, actor: a.userId, count: a.count, name: a.name, title: a.title, label: a.label }).title.replace(A.name(a.userId) + ' ', '') })) : [];
+      const list = Array.from(A.adminLog.values()).map(a => Object.assign({ text: describe(a) }, a)).concat(audits).sort((a, b) => b.ts - a.ts).slice(0, 200);
       if (!list.length) return h('p', { class: 'muted' }, 'No admin actions yet. Renames, archives, password resets and removals show up here.');
       return h('table', { class: 'table' }, h('thead', null, h('tr', null, h('th', null, 'When'), h('th', null, 'Who'), h('th', null, 'What'))),
         h('tbody', null, list.map(a => h('tr', null,
           h('td', { class: 'muted' }, U.formatDateTime(a.ts)),
           h('td', null, A.name(a.userId)),
-          h('td', null, describe(a), a.valid ? null : [' ', h('span', { class: 'pill grey', title: 'Not allowed for this person, so every app ignores it' }, 'Ignored')])))));
+          h('td', null, a.text, a.valid ? null : [' ', h('span', { class: 'pill grey', title: 'Not allowed for this person, so every app ignores it' }, 'Ignored')])))));
     }
     async function resetPw(u) {
       const temp = U.rand(4, 'abcdefghjkmnpqrstuvwxyz') + '-' + U.rand(4, '23456789') + '-' + U.rand(4, 'abcdefghjkmnpqrstuvwxyz');
-      const ok = await UI.confirm({ title: `Reset ${u.name}’s password?`, ok: 'Reset password', danger: true,
-        text: `This creates new security keys protected by a temporary password. ${u.name} must choose a new password when they sign in. Their direct messages from before the reset (7 days at most) can’t be opened afterwards.` });
+      const hasQ = await A.hasRecovery(u.id).catch(() => false);
+      const ok = await new Promise(resolve => {
+        let result = false;
+        const typed = h('input', { class: 'input', id: 'rp-confirm', autocomplete: 'off', placeholder: u.name });
+        const go = h('button', { class: 'btn btn-danger', disabled: true, onclick: () => { result = true; m.close(); } }, hasQ ? 'Reset anyway' : 'Reset password');
+        typed.addEventListener('input', () => { go.disabled = typed.value.trim().toLowerCase() !== u.name.toLowerCase(); });
+        const m = UI.modal({ title: `Reset ${u.name}’s password?`, cls: 'mid', onClose: () => resolve(result), body: [
+          hasQ ? h('div', { class: 'note note-info' }, icon('key'), h('div', null, h('b', null, `${u.name} has a security question. `),
+            'Ask them to click “Forgot password?” on the sign-in screen instead. That keeps all their messages. Only reset if they’ve forgotten the answer too.')) : null,
+          h('div', { class: 'note note-warn', style: { marginBottom: '14px' } }, icon('alert'), h('div', null, h('b', null, 'This can’t be undone. '), `${u.name} gets new security keys, so:`,
+            h('ul', { style: { margin: '6px 0 0', paddingLeft: '18px' } },
+              h('li', null, 'their direct messages from before the reset can’t be opened any more (by them or anyone else)'),
+              h('li', null, 'their security question is deleted, and they must set a new one'),
+              h('li', null, 'they must enter their real name again'),
+              h('li', null, 'they must choose a new password with the temporary one you give them')))),
+          h('div', { class: 'field' }, h('label', { for: 'rp-confirm' }, `Type ${u.name} to confirm`), typed)],
+          foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), go] });
+        setTimeout(() => typed.focus(), 0);
+      });
       if (!ok) return;
       try {
         await A.resetPassword(u.id, temp);
@@ -2135,7 +2397,24 @@
       return h('div', null, err,
         h('div', { class: 'field' }, h('label', { for: 'ad-name' }, 'Workspace name'), name),
         h('div', { class: 'field' }, h('label', { for: 'ad-lock' }, 'Auto-lock when idle'), lock, h('div', { class: 'hint' }, 'Signs people out after this long without using the PC. Doesn’t apply where someone ticked “Keep me signed in”.')),
-        ok, groupNames());
+        ok, groupNames(), updateSection());
+    }
+    function updateSection() {
+      const on = !!A.maintenance();
+      const msg = h('input', { class: 'input', id: 'ad-maint', maxlength: 200, placeholder: 'Optional message, e.g. “Back in 10 minutes.”' });
+      const btn = h('button', { class: on ? 'btn btn-primary' : 'btn btn-danger' }, icon('refresh'), on ? 'Finish update' : 'Start update');
+      btn.addEventListener('click', async () => {
+        if (on) { m.close(); return finishUpdate(); }
+        if (!(await UI.confirm({ title: 'Start update mode?', ok: 'Disconnect everyone', danger: true,
+          text: 'Within a few seconds everyone else sees “Sankyo Chat is being updated” and stops reading or writing the shared drive. Messages they were typing stay on their PC. When you click Finish update, their app reloads with the new files.' }))) return;
+        try { await A.setMaintenance(true, msg.value); m.close(); UI.toast('Update mode is on. Copy the new files now.', 'ok'); schedule('banners'); } catch (e) { UI.toast(e.message, 'error'); }
+      });
+      return h('div', { class: 'group-names' }, h('h3', null, 'Update the app'),
+        h('p', { class: 'muted', style: { fontSize: '13px' } }, on
+          ? 'Update mode is on: everyone else is disconnected. Copy the new app files over the SankyoChat folder (never over data), then click Finish update.'
+          : 'Before you copy a new version onto the share, start update mode. It notifies everyone and disconnects them, so nobody writes to the share while files change. Apps older than 1.9 don’t know this mode: the first time, ask people to reload.'),
+        on ? null : h('div', { class: 'field' }, h('label', { for: 'ad-maint' }, 'Message to show'), msg),
+        btn);
     }
     function groupNames() {
       const err = h('div', { class: 'form-error hidden', role: 'alert' });
@@ -2178,6 +2457,359 @@
     }
     const m = UI.modal({ title: 'Admin settings', cls: 'wide', body: [tabs, panel] });
     draw();
+  }
+
+  /* ================= Groups (PICKUP / INPUT) member panel ================= */
+
+  function openTeam(tid) {
+    if (!A.teamList().some(t => t.id === tid)) return;
+    if (el.ta && st.openId) st.drafts[st.openId] = el.ta.value;
+    st.openId = TEAM + tid;
+    Y.openId = null;
+    U.ls.set('lastOpen.' + A.ws.id, st.openId);
+    st.editingId = null;
+    st.teamBuilt = null;
+    el.root.classList.remove('side-open');
+    UI.closePopover();
+    renderSidebar(); renderHeader(); renderKeyNotice(); buildComposer(); renderMessages(); renderPins();
+  }
+
+  function renderTeam() {
+    const box = el.msgs;
+    if (!box) return;
+    const tid = openTeamId();
+    if (st.teamBuilt !== tid || !box.querySelector('.team-view')) {
+      const q = h('input', { class: 'input', type: 'search', placeholder: 'Search members', 'aria-label': 'Search members' });
+      const list = h('div', { class: 'team-list', role: 'list' });
+      q.addEventListener('input', () => drawTeamList());
+      UI.set(box, h('div', { class: 'team-view' }, h('div', { class: 'team-search' }, q), list));
+      st.teamEls = { q, list };
+      st.teamBuilt = tid;
+      box.scrollTop = 0;
+    }
+    drawTeamList();
+  }
+
+  function drawTeamList() {
+    const { q, list } = st.teamEls || {};
+    if (!list) return;
+    const tid = openTeamId();
+    const s = q.value.trim().toLowerCase();
+    const rank = { online: 0, away: 1, offline: 2 };
+    const members = A.teamMembers(tid).filter(u => !s || u.name.toLowerCase().includes(s))
+      .sort((a, b) => rank[Y.presenceOf(a.id).state] - rank[Y.presenceOf(b.id).state] || a.name.localeCompare(b.name));
+    const row = (u, extra) => {
+      const p = Y.presenceOf(u.id);
+      const role = A.roleLabel(u.id);
+      return h('div', { class: 'team-row', role: 'listitem', 'data-user': u.id },
+        h('button', { class: 'team-who', 'data-action': 'profile', 'aria-label': `${u.name}, ${UI.stateLabel(p.state)}. Open profile` },
+          h('span', { class: 'av-wrap' }, UI.avatar(u, 38), UI.dot(p.state)),
+          h('span', { class: 'who' },
+            h('span', { class: 'nm' }, u.name + (u.id === meId() ? ' (you)' : ''), role ? h('span', { class: 'pill' + (role === 'Super admin' ? '' : ' grey') }, role) : null),
+            h('span', { class: 'sub' }, [u.title, p.statusText || UI.stateLabel(p.state)].filter(Boolean).join(' · ')))),
+        extra || (u.id !== meId() ? h('button', { class: 'btn btn-sm', 'data-action': 'dm' }, icon('message'), 'Message') : null));
+    };
+    const kids = [];
+    if (!members.length) kids.push(h('div', { class: 'ann-empty' }, s ? 'No one matches.' : 'Nobody has been accepted into this group yet.'));
+    kids.push(...members.map(u => row(u)));
+    const waiting = A.isAdmin() ? A.teamPending().filter(u => A.teamRequest(u.id) === tid) : [];
+    if (waiting.length) {
+      kids.push(h('div', { class: 'team-wait-head' }, h('span', { class: 'wait-dot' }), `Waiting for acceptance (${waiting.length}) · only admins see this`));
+      kids.push(...waiting.map(u => row(u, h('span', { class: 'row', style: { gap: '6px' } },
+        h('button', { class: 'btn btn-sm btn-primary', 'data-action': 'accept' }, 'Accept'),
+        h('button', { class: 'btn btn-sm', 'data-action': 'change' }, 'Change')))));
+    }
+    UI.set(list, ...kids);
+  }
+
+  async function onTeamClick(t) {
+    const rowEl = t.closest('[data-user]');
+    if (!rowEl) return;
+    const id = rowEl.dataset.user;
+    switch (t.dataset.action) {
+      case 'profile': return profileDialog(id);
+      case 'dm': return Chat.openUser(id);
+      case 'accept':
+        try { await A.assignTeam(id, A.teamRequest(id)); UI.toast(`${A.name(id)} is now in ${A.teamName(A.teamOf(id))}`, 'ok'); schedule('msgs', 'side', 'head'); } catch (e) { UI.toast(e.message, 'error'); }
+        return;
+      case 'change': return adminDialog('people');
+    }
+  }
+
+  /* ================= notifications inbox ================= */
+
+  function notificationsDialog() {
+    if (st.inbox) return;
+    let tab = 'all';
+    const wasUnread = new Set(N.list().filter(N.isUnread).map(it => it.id));
+    const tabs = h('div', { class: 'tabs', role: 'tablist' });
+    const list = h('div', { class: 'notif-list', role: 'list' });
+    const canRequests = () => A.isAdmin() || Array.from(Y.chans.values()).some(c => c.kind === 'group' && Y.canManageGroup(c)) || N.list('requests').length > 0;
+    const tabBtn = (id, label, n) => h('button', { role: 'tab', 'aria-selected': String(tab === id), onclick: () => { tab = id; draw(); } }, label, n ? h('span', { class: 'tab-n' }, String(n)) : null);
+    function row(it) {
+      const d = N.describe(it);
+      const unread = wasUnread.has(it.id) || N.isUnread(it);
+      const u = it.actor ? A.users.get(it.actor) : null;
+      const lead = u ? UI.avatar(u, 36) : h('span', { class: 'avatar ann-avatar', style: { width: '36px', height: '36px' } }, icon(it.type === 'removed' ? 'userX' : it.type === 'aud' || it.type === 'adm' ? 'shield' : 'bell'));
+      const actions = [];
+      if (it.type === 'request' && !it.done) {
+        const yes = h('button', { class: 'btn btn-sm btn-primary' }, 'Approve');
+        const no = h('button', { class: 'btn btn-sm' }, 'Decline');
+        yes.addEventListener('click', e => { e.stopPropagation(); UI.busy(yes, null, async () => { await N.decide(it, true); UI.toast(`${A.name(it.who)} was added`, 'ok'); }).catch(ex => UI.toast(ex.message, 'error')); });
+        no.addEventListener('click', e => { e.stopPropagation(); UI.busy(no, null, async () => { await N.decide(it, false); UI.toast('Request declined', 'ok'); }).catch(ex => UI.toast(ex.message, 'error')); });
+        actions.push(yes, no);
+      }
+      if (it.type === 'team' && A.teamRequest(it.actor)) {
+        const yes = h('button', { class: 'btn btn-sm btn-primary' }, 'Accept');
+        yes.addEventListener('click', e => { e.stopPropagation(); UI.busy(yes, null, async () => { await A.assignTeam(it.actor, A.teamRequest(it.actor)); UI.toast('Group accepted', 'ok'); N.refresh(); }).catch(ex => UI.toast(ex.message, 'error')); });
+        actions.push(yes, h('button', { class: 'btn btn-sm', onclick: e => { e.stopPropagation(); close(); adminDialog('people'); } }, 'Change'));
+      }
+      return h('div', { class: 'notif-row' + (unread ? ' unread' : '') + (it.done ? ' done' : ''), role: 'listitem', tabindex: '0',
+        onclick: () => openNotification(it), onkeydown: e => { if (e.key === 'Enter' && e.target === e.currentTarget) openNotification(it); } },
+      lead,
+      h('div', { class: 'notif-main' },
+        h('div', { class: 'notif-title' }, d.title),
+        d.sub ? h('div', { class: 'notif-sub' }, d.sub) : null,
+        actions.length ? h('div', { class: 'row notif-actions', style: { gap: '6px' } }, actions) : null),
+      h('div', { class: 'notif-side' },
+        h('div', { class: 'notif-time', title: 'Arrived ' + new Date(it.at || it.ts).toLocaleString() }, U.formatDateTime(it.at || it.ts)),
+        unread ? h('span', { class: 'notif-dot', 'aria-label': 'Unread' }) : null));
+    }
+    function draw() {
+      const reqN = N.pendingRequests();
+      UI.set(tabs, tabBtn('all', 'All'), tabBtn('mentions', 'Mentions'), canRequests() ? tabBtn('requests', 'Requests', reqN) : null, A.isOwner() ? tabBtn('admin', 'Admin activity') : null);
+      const items = N.list(tab);
+      UI.set(list, items.length ? items.map(row) : h('div', { class: 'notif-empty' }, icon('check'), h('div', null, h('b', null, 'You’re all caught up.'),
+        h('div', { class: 'muted' }, tab === 'admin' ? 'What admins do shows up here.' : tab === 'requests' ? 'Requests to join your groups show up here.' : 'Mentions, replies and group changes show up here.'))));
+    }
+    function openNotification(it) {
+      N.markRead(it);
+      const go = fn => { close(); fn(); };
+      switch (it.type) {
+        case 'mention': case 'reply': case 'here':
+          if (!Y.chans.has(it.conv)) return UI.toast('That conversation is no longer available.');
+          return go(() => Chat.open(it.conv, { scrollTo: it.msg, ts: it.ts }));
+        case 'removed': return UI.toast('You’re no longer in it, so it can’t be opened.');
+        case 'team': return go(() => adminDialog('people'));
+        case 'newUser': return profileDialog(it.actor);
+        case 'adm': case 'aud': return go(() => adminDialog('activity'));
+        case 'ann': return go(() => Chat.open(ANN));
+        default:
+          if (it.conv && Y.chans.has(it.conv)) return go(() => Chat.open(it.conv));
+      }
+    }
+    const markAll = h('button', { class: 'btn btn-sm', onclick: () => { N.markAllRead(); wasUnread.clear(); draw(); } }, icon('check'), 'Mark all as read');
+    const setBtn = h('button', { class: 'btn btn-sm', onclick: () => notifSettingsDialog() }, icon('settings'), 'Settings');
+    const m = UI.modal({ title: 'Notifications', cls: 'mid notif-dlg', body: [h('div', { class: 'row notif-tools' }, N.isQuiet() ? h('span', { class: 'pill grey' }, icon('bellOff'), `Do not disturb until ${U.formatDateTime(N.dndUntil())}`) : null, h('span', { style: { flex: 1 } }), markAll, setBtn), tabs, list],
+      onClose: () => { st.inbox = null; N.markAllRead(); } });
+    const close = () => m.close();
+    st.inbox = { draw };
+    draw();
+    N.markAllRead(); // opening the inbox counts as reading what's in it (the dots stay until it's closed)
+    N.refresh();
+  }
+
+  function notifSettingsDialog() {
+    const prefs = N.prefs();
+    const cats = ['mentions', 'groups', 'requests'].concat(A.isOwner() ? ['admin'] : []);
+    const boxes = cats.map(k => {
+      const cb = h('input', { type: 'checkbox', id: 'np-' + k, checked: prefs[k] !== false });
+      cb.addEventListener('change', () => N.setPref(k, cb.checked));
+      return h('label', { class: 'check', for: 'np-' + k }, cb, h('span', null, N.PREF_LABELS[k]));
+    });
+    const until = N.dndUntil();
+    const tomorrow8 = () => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(8, 0, 0, 0); return d.getTime(); };
+    const dnd = h('select', { class: 'select', id: 'np-dnd', 'aria-label': 'Do not disturb' },
+      h('option', { value: '0' }, until ? `On until ${U.formatDateTime(until)} (choose Off to end it)` : 'Off'),
+      until ? h('option', { value: 'off' }, 'Off') : null,
+      h('option', { value: String(60 * 60000) }, 'For 1 hour'),
+      h('option', { value: String(2 * 60 * 60000) }, 'For 2 hours'),
+      h('option', { value: 'tomorrow' }, 'Until tomorrow 8:00'));
+    dnd.addEventListener('change', () => {
+      const v = dnd.value;
+      if (v === '0') return;
+      N.setDnd(v === 'off' ? 0 : v === 'tomorrow' ? tomorrow8() : Date.now() + Number(v));
+      UI.toast(v === 'off' ? 'Do not disturb is off' : `Do not disturb until ${U.formatDateTime(N.dndUntil())}`, 'ok');
+      schedule('side');
+      m.close();
+    });
+    const perm = SC.app.notificationState();
+    const m = UI.modal({ title: 'Notification settings', cls: 'mid', body: [
+      h('p', { class: 'muted', style: { fontSize: '14px', marginTop: 0 } }, 'The bell (top left) always keeps everything. These choose what also pops up on your desktop.'),
+      h('div', { class: 'field' }, h('span', { class: 'label' }, 'Pop up for'), boxes,
+        h('div', { class: 'hint' }, 'Direct messages and group chat messages always pop up, unless you mute that conversation in its Details.')),
+      h('div', { class: 'field' }, h('label', { for: 'np-dnd' }, 'Do not disturb'), dnd, h('div', { class: 'hint' }, 'Silences pop-ups and sounds. Unread counts and the bell still update.')),
+      perm === 'granted' ? null : h('div', { class: 'note note-info' }, icon('bell'), h('div', null, perm === 'denied'
+        ? 'Desktop notifications are blocked for this page. Allow them in the browser’s site settings (the lock icon next to the address).'
+        : h('span', null, 'Desktop notifications are off. ', h('button', { class: 'link-btn', onclick: () => SC.app.requestNotifications() }, 'Turn them on'))))],
+    foot: [h('button', { class: 'btn btn-primary', onclick: () => m.close() }, 'Done')] });
+  }
+
+  /* ================= Browse groups / suggest someone ================= */
+
+  async function browseGroupsDialog() {
+    const list = h('div', { class: 'people-list browse-list' }, h('div', { class: 'muted', style: { padding: '10px' } }, 'Looking for groups…'));
+    const m = UI.modal({ title: 'Browse groups', cls: 'mid', body: [
+      h('p', { class: 'muted', style: { fontSize: '14px', marginTop: 0 } }, 'Group chats and private channels whose admins let people ask to join. A group admin approves each request; you’ll get a notification.'), list] });
+    let entries = [];
+    try { entries = await N.browse(); } catch (e) { UI.set(list, h('div', { class: 'form-error' }, e.message)); return; }
+    const draw = () => UI.set(list, entries.length ? entries.map(e => {
+      const action = e.member ? h('button', { class: 'btn btn-sm', onclick: () => { m.close(); Chat.open(e.id); } }, 'Open')
+        : e.pending || N.hasPendingRequest(e.id) ? h('span', { class: 'pill grey' }, 'Requested')
+          : h('button', { class: 'btn btn-sm btn-primary', onclick: async () => {
+            const note = await UI.prompt({ title: `Ask to join ${e.channel ? '#' : ''}${e.name}`, label: 'Note for the group admins (optional)', ok: 'Send request', maxlength: N.MAX_NOTE,
+              hint: 'They see your name and this note.', onOk: v => N.requestJoin(e, v) });
+            if (note != null) { UI.toast('Request sent. You’ll get a notification when a group admin decides.', 'ok'); e.pending = true; draw(); }
+          } }, 'Ask to join');
+      return h('div', { class: 'person', style: { cursor: 'default' } },
+        h('span', { class: 'avatar ann-avatar', style: { width: '36px', height: '36px' } }, icon(e.channel ? 'lock' : 'users')),
+        h('div', { style: { flex: 1, minWidth: 0 } }, h('div', { class: 'nm' }, (e.channel ? '#' : '') + e.name),
+          h('div', { class: 'sub' }, [`${e.channel ? 'Private channel' : 'Group chat'} · ${e.count} ${e.count === 1 ? 'member' : 'members'}`, e.description].filter(Boolean).join(' · '))),
+        action);
+    }) : h('div', { class: 'muted', style: { padding: '10px' } }, 'No groups are listed yet. Group admins can list one from its Details.'));
+    draw();
+  }
+
+  function suggestMemberDialog(ch) {
+    const err = h('div', { class: 'form-error hidden', role: 'alert' });
+    const ok = h('button', { class: 'btn btn-primary', disabled: true }, 'Send suggestion');
+    const note = h('input', { class: 'input', id: 'sg-note', maxlength: N.MAX_NOTE, placeholder: 'Why should they join? (optional)' });
+    const pp = peoplePicker({ multi: false, max: 1, exclude: Y.members(ch), onChange: set => { ok.disabled = !set.size; } });
+    ok.addEventListener('click', () => UI.busy(ok, null, async () => {
+      const who = Array.from(pp.picked)[0];
+      await N.suggest(ch, who, note.value);
+      m.close(); UI.toast(`Suggestion sent. A group admin decides whether to add ${A.name(who)}.`, 'ok');
+    }, err));
+    const m = UI.modal({ title: `Suggest someone for ${chName(ch)}`, cls: 'mid', body: [err,
+      h('p', { class: 'muted', style: { fontSize: '14px', marginTop: 0 } }, 'Only the group’s creator and group admins can add people. They get your suggestion, encrypted so only members of this group can read it.'),
+      pp.el, h('div', { class: 'field' }, h('label', { for: 'sg-note' }, 'Note'), note)],
+    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+  }
+
+  /* ================= profile ================= */
+
+  function profileDialog(userId) {
+    const u = A.users.get(userId);
+    if (!u) return;
+    const p = Y.presenceOf(userId);
+    const role = A.roleLabel(userId);
+    const team = A.teamOf(userId) ? A.teamName(A.teamOf(userId)) : A.teamRequest(userId) ? `${A.teamName(A.teamRequest(userId))} (waiting for an admin)` : 'None yet';
+    const common = userId === meId() ? [] : Array.from(Y.chans.values())
+      .filter(c => c.kind === 'group' && c.groupName && Y.members(c).includes(userId)).sort((a, b) => chName(a).localeCompare(chName(b)));
+    // real name: only admins (and the person themselves) see this row
+    let realRow = null;
+    if (A.isAdmin() || userId === meId()) {
+      realRow = h('dd', { class: 'real-name' }, '…');
+      A.realNameOf(userId).then(n => {
+        UI.set(realRow, n || (A.realNamePending(userId) ? 'Not shared with you yet (it appears after they next open the app)' : 'Not given'),
+          ' ', h('span', { class: 'pill grey', title: 'Encrypted; only admins can read it' }, icon('lock'), userId === meId() ? 'Only admins see this' : 'Admins only'));
+      });
+    }
+    const seen = p.state === 'online' ? 'Online now' : p.state === 'away' ? 'Away' : p.lastSeen ? `Last seen ${U.relTime(p.lastSeen)}` : 'Offline';
+    const foot = [];
+    if (userId !== meId()) foot.push(h('button', { class: 'btn btn-primary', onclick: () => { UI.closeAll(); Chat.openUser(userId); } }, icon('message'), 'Message'));
+    else foot.push(h('button', { class: 'btn btn-primary', onclick: () => { m.close(); editProfileDialog(); } }, icon('edit'), 'Edit profile'));
+    if (A.isAdmin() && userId !== meId()) foot.unshift(h('button', { class: 'btn', onclick: () => { UI.closeAll(); adminDialog('people'); } }, icon('shield'), 'Manage'));
+    const m = UI.modal({ title: 'Profile', cls: 'mid', body: h('div', { class: 'profile' },
+      h('div', { class: 'profile-top' },
+        h('span', { class: 'av-wrap' }, UI.avatar(u, 84), UI.dot(p.state)),
+        h('div', null,
+          h('div', { class: 'profile-name' }, u.name, role ? h('span', { class: 'pill' + (role === 'Super admin' ? '' : ' grey') }, role) : null),
+          u.title ? h('div', { class: 'profile-title' }, u.title) : null,
+          h('div', { class: 'muted row', style: { gap: '6px', fontSize: '14px' } }, UI.dot(p.state), seen),
+          p.statusText ? h('div', { class: 'profile-status' }, icon('status'), p.statusText) : null)),
+      u.about ? h('p', { class: 'profile-about' }, u.about) : null,
+      h('dl', { class: 'kv' },
+        realRow ? [h('dt', null, 'Real name'), realRow] : null,
+        h('dt', null, 'Group'), h('dd', null, team),
+        h('dt', null, 'Member since'), h('dd', null, new Date(u.created).toLocaleDateString()),
+        userId !== meId() ? [h('dt', null, 'Groups in common'), h('dd', null, common.length ? common.map(chName).join(', ') : 'None')] : null)),
+    foot });
+  }
+
+  /* ================= announcements: edit ================= */
+
+  function editAnnouncementDialog(a) {
+    if (!a || !Y.canEditAnnouncement(a)) return UI.toast('Only the admin who posted it can edit it.');
+    const err = h('div', { class: 'form-error hidden', role: 'alert' });
+    const title = h('input', { class: 'input', id: 'ea-title', maxlength: 120, value: a.title || '' });
+    const text = h('textarea', { class: 'input', id: 'ea-text', rows: 6, maxlength: String(Y.MAX_TEXT) });
+    text.value = a.text;
+    const ok = h('button', { class: 'btn btn-primary' }, 'Save changes');
+    ok.addEventListener('click', () => UI.busy(ok, null, async () => { await Y.editAnnouncement(a.id, { title: title.value, text: text.value }); m.close(); UI.toast('Announcement updated', 'ok'); }, err));
+    const m = UI.modal({ title: 'Edit announcement', cls: 'mid', body: [err,
+      h('div', { class: 'field' }, h('label', { for: 'ea-title' }, 'Title (optional)'), title),
+      h('div', { class: 'field' }, h('label', { for: 'ea-text' }, 'Message'), text,
+        h('div', { class: 'hint' }, 'Everyone it was sent to sees the new text, marked “edited”. It doesn’t pop up again for people who already read it.'))],
+    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+    text.focus();
+  }
+
+  /* ================= privacy and security ================= */
+
+  function privacyDialog(focus) {
+    const sec = (id, ic, title, lines) => h('section', { class: 'privacy-sec' + (focus === id ? ' focus' : ''), 'data-sec': id },
+      h('h3', null, icon(ic), title), h('ul', null, lines.map(l => h('li', null, l))));
+    const body = h('div', { class: 'privacy' },
+      h('p', { class: 'muted', style: { marginTop: 0 } }, 'What Sankyo Chat protects, and who can read what. Encryption happens on your PC before anything reaches the shared drive.'),
+      sec('dm', 'lock', 'Direct messages', ['End-to-end encrypted: only you and the other person can read them, including file names and attachments.',
+        'Admins and the super admin can’t read them.', 'Deleted automatically 7 days after they’re sent.']),
+      sec('group', 'users', 'Group chats', ['End-to-end encrypted, including the group name: only current members can read them.',
+        'Someone removed from a group can’t read anything sent after they were removed (the group gets a new key).', 'Deleted automatically after 7 days.']),
+      sec('private', 'lock', 'Private channels', ['End-to-end encrypted, including the name and description: only invited people can see or read them, not even other admins.',
+        'History is kept. People invited later can read earlier messages.']),
+      sec('announcements', 'megaphone', 'Announcements', ['“Everyone” announcements are not encrypted: anyone with access to the shared drive can read them.',
+        'Private announcements are encrypted for the chosen people only. Sent to PICKUP GROUP or INPUT GROUP, they reach only people an admin has accepted into that group, so nobody in the other group can read them.',
+        'The list of who received a private announcement is visible on the shared drive; the title and text aren’t.',
+        'The super admin is told when an admin sends a private announcement, with its title and how many people got it, never the text.']),
+      sec('public', 'hash', 'Public channels', ['Not encrypted: anyone in the workspace can read them, and they’re stored as plain files on the shared drive.',
+        'Don’t post passwords or personal information there.']),
+      sec('admins', 'shield', 'What admins can and can’t do', ['Admins can create channels, hide public messages, reset passwords and accept people into groups. Every action is signed and logged.',
+        'Nobody, including the super admin, can read your direct messages, group chats or private channels unless they’re in them.',
+        'Your real name (Edit profile) is encrypted so only admins and the super admin can read it. Everyone else sees your display name.',
+        'Anyone with access to the shared drive can see who talks to whom and when (not what was said).']),
+      sec('you', 'key', 'What you can do', ['Use a password nobody else knows, and lock the PC (⚙ → Lock) when you step away.',
+        'Every profile has a security question (change it in ⚙ → Security question). If you forget your password, “Forgot password?” on the sign-in screen gets you back in with all your messages. Admins can’t use it, so your messages stay private.',
+        'In a direct message, compare the security code (Details) with the other person to be sure nobody swapped keys.']));
+    UI.modal({ title: 'Privacy and security', cls: 'mid', body });
+    if (focus) setTimeout(() => { const f = body.querySelector('.privacy-sec.focus'); if (f) f.scrollIntoView({ block: 'start' }); }, 50);
+  }
+
+  /* ================= what's new ================= */
+
+  /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
+  const NEWS = [
+    { version: '1.9.0', items: [
+      ['bell', 'Notifications', 'The bell at the top left collects mentions, replies, group changes and requests. Choose what pops up in ⚙ → Notification settings, or turn on Do not disturb.'],
+      ['users', 'Groups in the sidebar', 'PICKUP GROUP and INPUT GROUP have their own section. Click one to see who’s in it and who’s online.'],
+      ['search', 'Browse groups and ask to join', 'Group admins can list a group. Others find it with the search button next to Group chats and ask to join. Members can suggest someone from Details.'],
+      ['edit', 'Edit or delete announcements', 'Admins: hover over an announcement to edit or delete it. Edits show as “edited” and don’t pop up again.'],
+      ['info', 'Profiles', 'Click anyone’s name for their profile: job title, about, group, status and groups you share. Add yours in ⚙ → Edit profile, and your real name, which only admins can see.'],
+      ['key', 'Real name and security question for everyone', 'Every profile now needs both; you’re asked once after signing in. Your real name is only visible to admins. If you forget your password, “Forgot password?” on the sign-in screen gets you back in with all your messages and work.'],
+      ['megaphone', 'Announcements for each group', 'Private announcements for PICKUP or INPUT now have their own feed in the sidebar: Announcements (PICKUP) and Announcements (INPUT). You see your own group’s; the main Announcements keeps the ones for everyone.'],
+      ['shield', 'Privacy and security', 'See who can read what in ⚙ → Privacy and security, or click the lock badge in any private conversation.'],
+    ] },
+  ];
+  function showWhatsNew() {
+    const k = `newsSeen.${A.ws.id}.${meId()}`;
+    if (U.ls.get(k) === SC.VERSION) return;
+    U.ls.set(k, SC.VERSION);
+    if (!NEWS.some(n => n.version === SC.VERSION)) return;
+    setTimeout(() => { if (el.root && !UI.dialogOpen()) whatsNewDialog(); }, 800);
+  }
+  function whatsNewDialog() {
+    const m = UI.modal({ title: 'What’s new in Sankyo Chat', cls: 'mid', body: NEWS.map(n => h('div', { class: 'news' },
+      h('div', { class: 'news-ver' }, `Version ${n.version}` + (n.version === SC.VERSION ? ' · this version' : '')),
+      n.items.map(([ic, t, d]) => h('div', { class: 'news-item' }, h('span', { class: 'news-ic' }, icon(ic)), h('div', null, h('b', null, t), h('div', { class: 'muted' }, d)))))),
+    foot: [h('button', { class: 'btn btn-primary', onclick: () => m.close() }, 'Got it')] });
+  }
+
+  /* ================= update mode (super admin) ================= */
+
+  async function finishUpdate() {
+    if (!(await UI.confirm({ title: 'Finish the update?', ok: 'Finish and reload',
+      text: 'Make sure all the new app files are copied. Everyone’s app reloads with the new version within a few seconds, and so does yours.' }))) return;
+    try { await A.setMaintenance(false); location.reload(); } catch (e) { UI.toast(e.message, 'error'); }
   }
 
   SC.chat = Chat;
