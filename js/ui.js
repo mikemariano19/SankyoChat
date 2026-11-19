@@ -56,6 +56,9 @@
     zoomIn: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M11 8v6M8 11h6"/>',
     zoomOut: '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5M8 11h6"/>',
     fit: '<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/>',
+    board: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16M15 4v16M5.5 8h1M11.5 8h1M17.5 8h1M11.5 12h1"/>',
+    calendar: '<rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/>',
+    boardBell: '<rect x="3" y="4" width="13" height="13" rx="2"/><path d="M7.5 4v13M11.5 4v8"/><path d="M19 13.5a3 3 0 0 0-3 3V19h6v-2.5a3 3 0 0 0-3-3zM18 21h2"/>',
   };
   /** @param {string} name */
   UI.icon = function (name, cls) {

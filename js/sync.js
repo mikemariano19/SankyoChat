@@ -37,7 +37,7 @@
   const groupMiss = new Map(); // group id → newest activity ts when we last found we weren't a member (re-checked on newer activity)
   const discovering = new Map();
   let readMap = {};
-  let mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {} };
+  let mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {}, boardRead: 0 };
   let running = false;
   let timer = 0;
 
@@ -163,6 +163,8 @@
     return !!key && await C.verify(key, raw);
   }
 
+  Y.verifyRaw = verifyRaw;
+
   function cleanAttachments(list, kind) {
     if (!Array.isArray(list)) return [];
     return list.slice(0, Y.MAX_ATTACH).filter(a => a && /^[a-z0-9]{8}$/.test(a.fileId) && typeof a.name === 'string').map(a => {
@@ -233,13 +235,14 @@
     return out;
   }
 
-  /** A poll is {options: [{id, text}], multi}; its question is the message text. */
+  /** A poll is {options: [{id, text}]}; its question is the message text. Everyone gets one vote per poll
+   *  (older multiple-choice polls are treated as single choice too). */
   function cleanPoll(p) {
     if (!p || typeof p !== 'object' || !Array.isArray(p.options)) return null;
     const seen = new Set();
     const options = p.options.filter(o => o && typeof o.id === 'string' && /^[a-z0-9]{1,8}$/.test(o.id) && typeof o.text === 'string' && !seen.has(o.id) && seen.add(o.id))
       .slice(0, Y.MAX_POLL_OPTIONS).map(o => ({ id: o.id, text: o.text.slice(0, 100) }));
-    return options.length >= 2 ? { options, multi: !!p.multi } : null;
+    return options.length >= 2 ? { options, multi: false } : null;
   }
 
   /** Who may pin: admins in channels; the group's creator and group admins in groups. */
@@ -270,12 +273,12 @@
       if (now) { let set = msg.reactions.get(now); if (!set) msg.reactions.set(now, set = new Set()); set.add(ev.userId); }
     } else if (ev.type === 'vote') {
       if (!msg.poll || !Array.isArray(ev.choices)) return;
+      // one vote per person: only their newest vote event counts (by time, then id, so every device agrees)
       const prev = msg.votes.get(ev.userId);
-      if (prev && prev.ts > ev.ts) return;
+      if (prev && (prev.ts > ev.ts || (prev.ts === ev.ts && prev.id > ev.id))) return;
       const valid = new Set(msg.poll.options.map(o => o.id));
-      let choices = U.uniq(ev.choices.filter(c => valid.has(c)));
-      if (!msg.poll.multi) choices = choices.slice(0, 1);
-      msg.votes.set(ev.userId, { ts: ev.ts, choices });
+      const choices = U.uniq(ev.choices.filter(c => valid.has(c))).slice(0, 1);
+      msg.votes.set(ev.userId, { ts: ev.ts, id: ev.id, choices });
     }
   }
 
@@ -652,13 +655,13 @@
 
   /* ---- polls ---- */
   Y.myVote = msg => { const v = msg.votes && msg.votes.get(me()); return v ? v.choices : []; };
-  /** Toggle my vote for one option (single-choice polls move the vote). */
+  /** One vote per person: picking another option moves it, picking mine again takes it back. */
   Y.vote = (ch, msg, optionId) => {
     if (!msg.poll) return Promise.resolve();
     const mineNow = Y.myVote(msg);
     let choices;
     if (mineNow.includes(optionId)) choices = mineNow.filter(x => x !== optionId);
-    else choices = msg.poll.multi ? mineNow.concat(optionId) : [optionId];
+    else choices = [optionId];
     return event(ch, 'vote', { targetId: msg.id, choices });
   };
   /** Per option: the people who voted for it. */
@@ -669,7 +672,7 @@
     for (const v of msg.votes.values()) if (v.choices.length) voters++;
     return { byOption: out, voters };
   };
-  Y.sendPoll = async function (ch, { question, options, multi }) {
+  Y.sendPoll = async function (ch, { question, options }) {
     if (!A.isAdmin()) throw err('Only admins can create polls.');
     question = String(question || '').replace(/\s+$/, '').trim();
     if (!question) throw err('Write the question first.');
@@ -679,7 +682,7 @@
     if (texts.length > Y.MAX_POLL_OPTIONS) throw err(`Polls can have up to ${Y.MAX_POLL_OPTIONS} options.`);
     if (new Set(texts.map(t => t.toLowerCase())).size !== texts.length) throw err('Two options are the same.');
     if (texts.some(t => t.length > 100)) throw err('Options can be at most 100 characters.');
-    const poll = { options: texts.map((text, i) => ({ id: 'o' + (i + 1), text })), multi: !!multi };
+    const poll = { options: texts.map((text, i) => ({ id: 'o' + (i + 1), text })), multi: false };
     await event(ch, 'message', { text: question, mentions: Y.findMentions(ch, question), poll });
     Y.markRead(ch);
   };
@@ -1113,7 +1116,7 @@
       for (const k of Object.keys(mine.lastPost)) if (mine.lastPost[k] < cutoff) delete mine.lastPost[k];
       for (const k of Object.keys(mine.notifSeen)) if (!(mine.notifSeen[k] >= Date.now() - 30 * U.DAY_MS)) delete mine.notifSeen[k];
       for (const k of Object.keys(mine.acks)) { const pn = U.parseMsgName(k + '.json'); if (!pn || pn.ts < Date.now() - Y.ANN_DAYS * U.DAY_MS) delete mine.acks[k]; }
-      const data = { v: 1, userId: uid, lastSeen: Date.now(), status: status || Y.myStatus(), statusText: mine.statusText, statusTs: mine.statusTs, lastPost: mine.lastPost, seen: mySeen(), acks: mine.acks, notifRead: mine.notifRead, notifSeen: mine.notifSeen };
+      const data = { v: 1, userId: uid, lastSeen: Date.now(), status: status || Y.myStatus(), statusText: mine.statusText, statusTs: mine.statusTs, lastPost: mine.lastPost, seen: mySeen(), acks: mine.acks, notifRead: mine.notifRead, notifSeen: mine.notifSeen, boardRead: mine.boardRead };
       await S.writeJSON(`presence/${uid}.json`, data);
       Y.presence.set(uid, { data, mtime: 0 });
     } catch (e) { handleErr(e); } finally {
@@ -1128,11 +1131,19 @@
    * notifSeen = {notificationId: ts} for single items opened before that. */
   function mergeNotif(cur) {
     if (typeof cur.notifRead === 'number' && cur.notifRead > mine.notifRead) mine.notifRead = cur.notifRead;
+    if (typeof cur.boardRead === 'number' && cur.boardRead > mine.boardRead) mine.boardRead = cur.boardRead;
     if (cur.notifSeen && typeof cur.notifSeen === 'object') {
       for (const [k, v] of Object.entries(cur.notifSeen)) if (typeof v === 'number' && !(mine.notifSeen[k] >= v)) mine.notifSeen[k] = v;
     }
   }
   Y.notifRead = () => mine.notifRead;
+  /** Project board notifications have their own read-state (js/board.js), separate from chat's. */
+  Y.boardRead = () => mine.boardRead;
+  Y.markBoardRead = function (upTo) {
+    if (!(upTo > mine.boardRead)) return false;
+    mine.boardRead = upTo; heartbeat();
+    return true;
+  };
   Y.notifSeen = id => !!mine.notifSeen[id];
   Y.markNotifs = function (upTo, ids) {
     let changed = false;
@@ -1326,7 +1337,7 @@
     Y.startedAt = Date.now();
     Y.connected = true;
     readMap = U.ls.get(readKeyName(), {});
-    mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {} };
+    mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {}, boardRead: 0 };
     Y.announcements.clear(); badAnn.clear(); annHint = 0;
     const cur = await S.readJSON(`presence/${me()}.json`);
     if (cur && cur.userId === me()) {

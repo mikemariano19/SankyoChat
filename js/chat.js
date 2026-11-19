@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
   const SC = root.SC;
-  const U = SC.util, A = SC.account, Y = SC.sync, UI = SC.ui, C = SC.crypto, S = SC.store, N = SC.notify;
+  const U = SC.util, A = SC.account, Y = SC.sync, UI = SC.ui, C = SC.crypto, S = SC.store, N = SC.notify, B = SC.board, BV = SC.boardView;
   const h = UI.h, icon = UI.icon;
   /** @namespace SC.chat */
   const Chat = {};
@@ -40,6 +40,10 @@
   /** PICKUP GROUP / INPUT GROUP member lists (sidebar → Groups) use '@team:<groupId>'. They aren't conversations. */
   const TEAM = '@team:';
   const isTeam = () => typeof st.openId === 'string' && st.openId.startsWith(TEAM);
+  /** Each group's project board (js/board.js, js/board-ui.js) shows in the main pane as '@board:<groupId>'. */
+  const BOARD = '@board:';
+  const isBoard = () => typeof st.openId === 'string' && st.openId.startsWith(BOARD);
+  const openBoardId = () => (isBoard() ? st.openId.slice(BOARD.length) : '');
   const openTeamId = () => (isTeam() ? st.openId.slice(TEAM.length) : '');
   const cur = () => Y.chans.get(st.openId);
   /** How many of these people are online right now. */
@@ -98,17 +102,21 @@
       N.events.on('change', () => { schedule('side'); if (st.inbox) st.inbox.draw(); }),
       N.events.on('open', () => notificationsDialog()),
       Y.events.on('connection', () => schedule('side', 'banners')),
+      B.events.on('change', () => { schedule('side'); if (isBoard()) { if (leaveHiddenBoard()) return; schedule('msgs', 'head'); } }),
+      B.events.on('open', it => BV.notificationsDialog(it && it.type === 'completed' ? { tab: 'history', pid: it.pid } : {})),
       Y.events.on('incoming', onIncoming),
       Y.events.on('inbox', () => schedule('side')),
       Y.events.on('announcements', () => { schedule('side'); if (isAnn()) schedule('msgs'); showPendingAnnouncement(); }),
-      A.events.on('workspace', () => { schedule('side', 'head', 'composer', 'msgs', 'banners'); if (A.isRemoved(meId())) SC.app.lock('Your account was removed by the admin.'); else askTeamIfNeeded(); }),
+      A.events.on('workspace', () => { leaveHiddenBoard(); schedule('side', 'head', 'composer', 'msgs', 'banners'); if (A.isRemoved(meId())) SC.app.lock('Your account was removed by the admin.'); else askTeamIfNeeded(); }),
       A.events.on('users', () => { schedule('side', 'head', 'msgs', 'banners'); askTeamIfNeeded(); }),
       A.events.on('wsTampered', () => { st.banners.wsTampered = true; schedule('banners'); }),
     ];
     const last = U.ls.get('lastOpen.' + A.ws.id);
     const teamOk = typeof last === 'string' && last.startsWith(TEAM) && A.teamList().some(t => TEAM + t.id === last);
     const annOk = isAnnKey(last) && annFeeds().includes(last.slice(ANN.length + 1));
-    Chat.open(Y.chans.has(last) || annOk || teamOk ? last : (Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]));
+    BV.init({ profile: id => profileDialog(id), openBoard: team => Chat.open(BOARD + team) });
+    const boardOk = typeof last === 'string' && last.startsWith(BOARD) && B.canSee(last.slice(BOARD.length));
+    Chat.open(Y.chans.has(last) || annOk || teamOk || boardOk ? last : (Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]));
     if (A.isOwner()) A.loadInbox().then(ch => { if (ch) schedule('side'); }).catch(() => {});
     showPendingAnnouncement();
     renderBanners();
@@ -135,6 +143,7 @@
     st.inbox = null;
     st.teamAsk = false;
     st.setupAsk = false;
+    BV.reset();
   };
   Chat.mounted = () => !!el.root;
   Chat.showBanner = function (name, on) { st.banners[name] = on; schedule('banners'); };
@@ -143,6 +152,7 @@
   Chat.open = async function (id, opts = {}) {
     if (isAnnKey(id)) return openAnnouncements(id.length > ANN.length ? id.slice(ANN.length + 1) : '');
     if (typeof id === 'string' && id.startsWith(TEAM)) return openTeam(id.slice(TEAM.length));
+    if (typeof id === 'string' && id.startsWith(BOARD)) return openBoard(id.slice(BOARD.length));
     const ch = Y.chans.get(id);
     if (!ch) return;
     if (el.ta && st.openId) st.drafts[st.openId] = el.ta.value;
@@ -203,6 +213,7 @@
     };
     const inboxCount = A.isOwner() ? A.inboxUnread() : 0;
     const notifCount = N.unreadCount();
+    const boardCount = B.unreadCount();
     const quiet = N.isQuiet();
     // Groups (PICKUP / INPUT): a member list each, not a conversation
     const teamRows = A.teamList().map(t => {
@@ -217,13 +228,28 @@
       waiting ? h('span', { class: 'wait-dot', title: `${waiting} waiting for acceptance` }) : null,
       h('span', { class: 'cnt' }, String(members.length)));
     });
+    // Project boards: one per group (PICKUP / INPUT); the super admin sees every group's
+    const boardRows = B.boards().map(t => {
+      const bid = BOARD + t.id;
+      const active = st.openId === bid;
+      const open = B.openCount(t.id), mineN = B.mineCount(t.id);
+      const mine = A.teamOf(meId()) === t.id;
+      return h('button', { class: 'side-item team-item board-item' + (active ? ' active' : ''), 'data-open': bid, 'data-key': 'ch:' + bid, 'aria-current': active ? 'page' : null,
+        'aria-label': `${t.name} project board, ${open} open ${open === 1 ? 'project' : 'projects'}` + (mineN ? `, ${mineN} assigned to you` : '') },
+      icon('board'), h('span', { class: 'lbl' }, t.name), mine ? h('span', { class: 'you-tag' }, 'You') : null,
+      mineN ? h('span', { class: 'wait-dot board-mine-dot', title: `${mineN} open ${mineN === 1 ? 'project' : 'projects'} assigned to you` }) : null,
+      h('span', { class: 'cnt', title: `${open} open ${open === 1 ? 'project' : 'projects'}` }, String(open)));
+    });
     UI.set(el.side,
       h('div', { class: 'side-head' },
         h('div', { class: 'side-title' },
           h('h1', null, A.ws.name),
           h('button', { class: 'icon-btn bell-btn' + (notifCount ? ' has' : ''), 'data-act': 'notifications', 'data-key': 'bell',
             'aria-label': 'Notifications' + (notifCount ? `, ${notifCount} unread` : '') + (quiet ? ', do not disturb is on' : ''), title: quiet ? 'Notifications (do not disturb is on)' : 'Notifications' },
-          icon(quiet ? 'bellOff' : 'bell'), notifCount ? h('span', { class: 'badge red bell-badge' }, notifCount > 99 ? '99+' : String(notifCount)) : null)),
+          icon(quiet ? 'bellOff' : 'bell'), notifCount ? h('span', { class: 'badge red bell-badge' }, notifCount > 99 ? '99+' : String(notifCount)) : null),
+          h('button', { class: 'icon-btn bell-btn board-bell' + (boardCount ? ' has' : ''), 'data-act': 'board-notifications', 'data-key': 'boardbell',
+            'aria-label': 'Board notifications' + (boardCount ? `, ${boardCount} unread` : ''), title: 'Board notifications (projects)' },
+          icon('boardBell'), boardCount ? h('span', { class: 'badge red bell-badge' }, boardCount > 99 ? '99+' : String(boardCount)) : null)),
         h('div', { class: 'conn' }, UI.dot(Y.connected ? 'online' : 'offline'), Y.connected ? 'Shared drive connected' : 'Not connected to the shared drive')),
       h('button', { class: 'jump', 'data-act': 'jump', 'data-key': 'jump' }, icon('search'), 'Search or jump to…', h('kbd', null, 'Ctrl K')),
       h('nav', { class: 'side-scroll' },
@@ -236,6 +262,8 @@
         }),
         h('div', { class: 'side-sec' }, h('span', null, 'Groups')),
         teamRows,
+        h('div', { class: 'side-sec' }, h('span', null, 'Project boards')),
+        boardRows.length ? boardRows : h('div', { class: 'side-empty' }, 'Your board appears once an admin accepts your group'),
         h('div', { class: 'side-sec' }, h('span', null, 'Channels'), A.isAdmin() ? h('button', { class: 'icon-btn', 'data-act': 'new-channel', 'data-key': 'newch', 'aria-label': 'Create a channel', title: 'Create a channel' }, icon('plus')) : null),
         pub.map(item),
         h('div', { class: 'side-sec' }, h('span', null, 'Group chats'), h('span', { class: 'row', style: { gap: '0' } },
@@ -253,7 +281,7 @@
           h('div', { class: 'st' }, UI.dot(myP.state), myP.statusText || UI.stateLabel(myP.state))),
         h('button', { class: 'icon-btn', 'data-act': 'me-menu', 'data-key': 'me', 'aria-label': 'Profile and settings', title: 'Profile and settings' }, icon('settings'))));
     if (focusKey) { const f = el.side.querySelector(`[data-key="${CSS.escape(focusKey)}"]`); if (f) f.focus(); }
-    const n = Y.totalUnread() + notifCount;
+    const n = Y.totalUnread() + notifCount + boardCount;
     document.title = (n ? `(${n}) ` : '') + A.ws.name;
   }
 
@@ -268,6 +296,7 @@
       case 'new-group': return newGroupDialog();
       case 'browse-groups': return browseGroupsDialog();
       case 'notifications': return notificationsDialog();
+      case 'board-notifications': return BV.notificationsDialog();
       case 'feedback': return feedbackDialog();
       case 'inbox': return A.isOwner() ? inboxDialog() : null;
       case 'me-menu': return profileMenu(t);
@@ -284,6 +313,13 @@
         h('div', { class: 'two' }, h('div', { class: 'title' }, h('span', { class: 'nm' }, feedName(f)), f ? h('span', { class: 'pill' }, icon('lock'), 'Private') : null),
           h('div', { class: 'sub' }, f ? `From the admins · only for ${A.teamName(f)}, encrypted` : 'From the admins · to everyone, or privately to chosen people')),
         h('div', { class: 'tools' }, h('button', { class: 'icon-btn', 'aria-label': 'Who can read announcements', title: 'Who can read this?', onclick: () => privacyDialog('announcements') }, icon('shield'))));
+      return;
+    }
+    if (isBoard()) {
+      UI.set(el.head, menuBtn, h('span', { class: 'avatar ann-avatar', style: { width: '34px', height: '34px' } }, icon('board')),
+        h('div', { class: 'two' }, h('div', { class: 'title' }, h('span', { class: 'nm' }, A.teamName(openBoardId()) || 'Project board'), h('span', { class: 'pill grey' }, 'Project board')),
+          h('div', { class: 'sub' }, BV.headerSub(openBoardId()))),
+        h('div', { class: 'tools' }, h('button', { class: 'icon-btn', 'aria-label': 'Board notifications', title: 'Board notifications', onclick: () => BV.notificationsDialog() }, icon('boardBell'))));
       return;
     }
     if (isTeam()) {
@@ -502,6 +538,9 @@
       h('span', null, h('span', { class: 'fname' }, a.name), h('span', { class: 'fmeta' }, `${U.formatSize(a.size)} · ${pdf ? 'Click to view' : 'Click to save'}`)));
   }
 
+  /** Show a new centered time stamp when a conversation has been quiet this long. */
+  const TIME_GAP = 15 * 60000;
+
   /** Poll card: the question is the message text; options show live results. */
   function renderPoll(ch, m) {
     const res = Y.pollResults(m);
@@ -509,23 +548,23 @@
     const total = Array.from(res.byOption.values()).reduce((n, l) => n + l.length, 0);
     const archived = Y.info(ch).archived;
     return h('div', { class: 'poll' },
-      h('div', { class: 'poll-head' }, icon('poll'), h('span', null, 'Poll'), h('span', { class: 'muted' }, m.poll.multi ? ' · choose one or more' : ' · choose one')),
+      h('div', { class: 'poll-head' }, icon('poll'), h('span', null, 'Poll'), h('span', { class: 'muted' }, ' · one vote each')),
       h('div', { class: 'poll-q', html: UI.formatText(m.text, m.mentions) }),
-      h('div', { class: 'poll-opts', role: m.poll.multi ? 'group' : 'radiogroup', 'aria-label': 'Poll options' }, m.poll.options.map(o => {
+      h('div', { class: 'poll-opts', role: 'radiogroup', 'aria-label': 'Poll options' }, m.poll.options.map(o => {
         const voters = res.byOption.get(o.id) || [];
         const pct = total ? Math.round(voters.length * 100 / total) : 0;
         const picked = mineV.includes(o.id);
         return h('button', {
           class: 'poll-opt' + (picked ? ' picked' : ''), 'data-action': 'vote', 'data-opt': o.id, disabled: archived,
-          role: m.poll.multi ? 'checkbox' : 'radio', 'aria-checked': String(picked),
+          role: 'radio', 'aria-checked': String(picked),
           title: voters.length ? voters.map(A.name).sort().join(', ') : 'No votes yet',
         },
         h('span', { class: 'poll-fill', style: { width: pct + '%' } }),
-        h('span', { class: 'poll-check' + (m.poll.multi ? ' sq' : '') }, picked ? icon('check') : null),
+        h('span', { class: 'poll-check' }, picked ? icon('check') : null),
         h('span', { class: 'poll-txt' }, o.text),
         h('span', { class: 'poll-n' }, voters.length ? `${voters.length} · ${pct}%` : '0'));
       })),
-      h('div', { class: 'poll-foot' }, `${res.voters} ${res.voters === 1 ? 'person' : 'people'} voted` + (mineV.length ? ' · click your choice again to take it back' : '')));
+      h('div', { class: 'poll-foot' }, `${res.voters} ${res.voters === 1 ? 'person' : 'people'} voted` + (mineV.length ? ' · pick another option to change your vote' : '')));
   }
 
   function renderMsg(ch, m, grouped) {
@@ -540,7 +579,7 @@
     if (!grouped || pinned) {
       main.appendChild(h('div', { class: 'msg-head' },
         grouped ? null : h('button', { class: 'msg-name', 'data-action': 'profile' }, u ? u.name : 'Unknown user'),
-        grouped ? null : h('span', { class: 'msg-time', title: new Date(m.ts).toLocaleString() }, time),
+        grouped ? null : h('span', { class: 'msg-time', title: U.formatFull(m.ts) }, time),
         pinned ? h('span', { class: 'pinned-tag', title: 'Pinned by ' + A.name(ch.pins.get(m.id).by) }, icon('pin'), 'Pinned') : null));
     }
     if (m.deleted) main.appendChild(h('div', { class: 'msg-text gone' }, 'Message deleted'));
@@ -572,7 +611,7 @@
         main.appendChild(renderPoll(ch, m));
       } else if (m.text) {
         const t = h('div', { class: 'msg-text' + (UI.isBigEmoji(m.text.trim()) ? ' big-emoji' : ''), html: UI.formatText(m.text, m.mentions) });
-        if (m.edited) t.appendChild(h('span', { class: 'edited', title: m.editTs ? 'Edited ' + new Date(m.editTs).toLocaleString() : null }, '(edited)'));
+        if (m.edited) t.appendChild(h('span', { class: 'edited', title: m.editTs ? 'Edited ' + U.formatFull(m.editTs) : null }, '(edited)'));
         if (m.local && m.status === 'sending') t.appendChild(h('span', { class: 'msg-status' }, icon('clock'), 'Sending…'));
         main.appendChild(t);
       } else if (m.local && m.status === 'sending') main.appendChild(h('span', { class: 'msg-status' }, icon('clock'), 'Sending…'));
@@ -597,7 +636,7 @@
       main.appendChild(body);
     }
     const row = h('div', { class: cls, 'data-id': m.id },
-      h('div', { class: 'msg-gutter' }, grouped ? h('span', { class: 'hover-time' }, time)
+      h('div', { class: 'msg-gutter' }, grouped ? h('span', { class: 'hover-time', title: U.formatFull(m.ts) }, time)
         : h('button', { class: 'avatar-btn', 'data-action': 'profile', 'aria-label': `${u ? u.name : 'Unknown user'}: view profile`, title: 'View profile' }, UI.avatar(u, 40))), main);
     if (!m.local && shown && body && !Y.info(ch).archived) {
       const tools = h('div', { class: 'msg-tools', role: 'toolbar', 'aria-label': 'Message actions' },
@@ -613,18 +652,29 @@
     return row;
   }
 
-  /** The action bar sits beside the message; when there isn't room there (a wide message), it goes above it. */
+  /** The action bar sits beside the message, lined up with the bubble itself (not the reactions or files
+   *  under it); when there isn't room there (a wide message), it goes above it. */
   function placeTools(e) {
     const row = e.target.closest && e.target.closest('.msg');
-    if (!row || row === placeTools.last) return;
-    placeTools.last = row;
+    const w = el.msgs.clientWidth;
+    if (!row || (row === placeTools.last && w === placeTools.w)) return;
+    placeTools.last = row; placeTools.w = w;
     const body = row.querySelector(':scope > .msg-main > .msg-body');
     const tools = body && body.querySelector(':scope > .msg-tools');
     if (!tools) return;
     const box = el.msgs.getBoundingClientRect(), b = body.getBoundingClientRect();
     const need = tools.offsetWidth || tools.children.length * 32 + 10; // hidden until hover, so estimate
     const room = row.classList.contains('mine') ? b.left - box.left - 8 : box.right - b.right - 8;
-    body.classList.toggle('tools-above', room < need + 6);
+    const above = room < need + 6;
+    body.classList.toggle('tools-above', above);
+    tools.style.top = '';
+    if (above) return;
+    const first = body.firstElementChild;
+    if (!first || first === tools) return;
+    const BAR = 38; // toolbar height
+    // short bubble: centre the bar on it; tall content (poll, album, long text): line it up with the top
+    const top = first.offsetHeight <= BAR * 1.6 ? first.offsetTop + first.offsetHeight / 2 - BAR / 2 : first.offsetTop;
+    tools.style.top = Math.round(top) + 'px';
   }
 
   /** Who has read up to my newest message; re-render only when this changes. */
@@ -649,6 +699,8 @@
   }
 
   function renderMessages() {
+    if (el.msgs) el.msgs.classList.toggle('board-mode', isBoard());
+    if (isBoard()) return BV.render(el.msgs, openBoardId());
     if (isAnn()) return renderAnnouncements();
     if (isTeam()) return renderTeam();
     const ch = cur();
@@ -665,10 +717,15 @@
     let myLast = null;
     if (ch.kind !== 'public') for (const m of list) if (m.userId === meId() && !m.local && !m.deleted) myLast = m;
     st.seenSig = seenSig(ch);
-    let prev = null, lastDay = '', divDone = false;
+    let prev = null, lastDay = '', lastTs = 0, divDone = false;
     for (const m of list) {
+      // like Messenger: a centered time stamp at the start of each day and after a quiet gap
       const day = U.localDay(m.ts);
-      if (day !== lastDay) { frag.appendChild(h('div', { class: 'day-div', role: 'separator' }, U.formatDayLabel(m.ts))); lastDay = day; prev = null; }
+      if (day !== lastDay || m.ts - lastTs >= TIME_GAP) {
+        frag.appendChild(h('div', { class: 'day-div', role: 'separator', title: U.formatFull(m.ts) }, U.formatDateTime(m.ts)));
+        prev = null;
+      }
+      lastDay = day; lastTs = m.ts;
       if (!divDone && st.dividerTs && !m.local && m.ts > st.dividerTs && m.userId !== meId()) {
         frag.appendChild(h('div', { class: 'new-div', role: 'separator' }, 'New messages'));
         divDone = true; prev = null;
@@ -1013,6 +1070,7 @@
   /* ================= composer ================= */
 
   function buildComposer() {
+    if (isBoard()) { el.ta = null; UI.set(el.composerWrap); return; }
     if (isTeam()) {
       el.ta = null;
       const tid = openTeamId();
@@ -1885,7 +1943,7 @@
     let lastDay = '', divDone = false;
     for (const a of items) {
       const day = U.localDay(a.ts);
-      if (day !== lastDay) { frag.appendChild(h('div', { class: 'day-div', role: 'separator' }, U.formatDayLabel(a.ts))); lastDay = day; }
+      if (day !== lastDay) { frag.appendChild(h('div', { class: 'day-div', role: 'separator', title: U.formatFull(a.ts) }, U.formatDayLabel(a.ts))); lastDay = day; }
       const fresh = st.annFresh.has(a.id);
       if (fresh && !divDone) { frag.appendChild(h('div', { class: 'new-div', role: 'separator' }, 'New')); divDone = true; }
       const u = A.users.get(a.userId);
@@ -1904,8 +1962,8 @@
           h('div', { class: 'msg-head' }, h('button', { class: 'msg-name', 'data-action': 'profile' }, A.name(a.userId)),
             role ? h('span', { class: 'pill grey' }, role) : null,
             a.to ? h('span', { class: 'pill', title: a.to.filter(x => x !== a.userId).map(A.name).sort().join(', ') }, icon('lock'), `Private · ${a.to.filter(x => x !== a.userId).length} people`) : null,
-            h('span', { class: 'msg-time', title: new Date(a.ts).toLocaleString() }, U.formatTime(a.ts)),
-            a.editTs ? h('span', { class: 'msg-time', title: 'Edited ' + new Date(a.editTs).toLocaleString() }, '(edited)') : null),
+            h('span', { class: 'msg-time', title: U.formatFull(a.ts) }, U.formatTime(a.ts)),
+            a.editTs ? h('span', { class: 'msg-time', title: 'Edited ' + U.formatFull(a.editTs) }, '(edited)') : null),
           h('div', { class: 'ann-card' },
             a.title ? h('div', { class: 'ann-title' }, a.title) : null,
             h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, []) }),
@@ -1990,10 +2048,9 @@
       addBtn.disabled = opts.length >= Y.MAX_POLL_OPTIONS;
     }
     draw();
-    const multi = h('input', { type: 'checkbox' });
     const ok = h('button', { class: 'btn btn-primary' }, icon('poll'), 'Post poll');
     ok.addEventListener('click', () => UI.busy(ok, null, async () => {
-      await Y.sendPoll(ch, { question: q.value, options: opts, multi: multi.checked });
+      await Y.sendPoll(ch, { question: q.value, options: opts });
       m.close();
       st.stick = true;
       schedule('msgs');
@@ -2001,8 +2058,7 @@
     const m = UI.modal({ title: `Create a poll in ${chName(ch)}`, cls: 'mid', body: [err,
       h('div', { class: 'field' }, h('label', { for: 'pl-q' }, 'Question'), q),
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Options'), box, h('div', null, addBtn)),
-      h('label', { class: 'check' }, multi, h('span', null, 'Let people choose more than one option')),
-      h('p', { class: 'muted', style: { fontSize: '13px', marginTop: '10px' } }, 'Everyone in this conversation can vote and change their vote. Hover an option to see who picked it.')],
+      h('p', { class: 'muted', style: { fontSize: '13px', marginTop: '10px' } }, 'Everyone in this conversation gets one vote and can change it. Hover an option to see who picked it.')],
     foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
   }
 
@@ -2216,7 +2272,7 @@
         ['Rename, describe, archive, export', 'Archived channels stay readable from Admin settings → Channels.', where('Channel → ⓘ Details')],
       ]],
       ['In conversations', 'message', [
-        ['Create a poll', 'Single or multiple choice, in any conversation you’re in. Everyone can vote and change their vote.', where('Chart button next to 📎 in the message box')],
+        ['Create a poll', 'In any conversation you’re in. Everyone gets one vote and can change it.', where('Chart button next to 📎 in the message box')],
         ['Pin messages', 'Shown in a bar at the top of the channel. Group creators and group admins can pin in their groups too.', where('Hover a message → 📌')],
         ['Hide a message in a channel', 'Everyone sees “Message hidden by the admin”.', where('Hover a message → eye icon')],
       ]],
@@ -2461,6 +2517,28 @@
 
   /* ================= Groups (PICKUP / INPUT) member panel ================= */
 
+  /** My group changed (or I'm no longer the super admin): don't keep showing another group's board. */
+  function leaveHiddenBoard() {
+    if (!isBoard() || B.canSee(openBoardId())) return false;
+    UI.closeAll();
+    UI.toast('That project board is only for its own group.');
+    Chat.open(Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]);
+    return true;
+  }
+
+  function openBoard(team) {
+    // an old '@board' link, or a board I can no longer see: fall back to the first one I can
+    if (!B.canSee(team)) { const first = B.boards()[0]; if (!first) { UI.toast('Your project board appears once an admin accepts your group.'); return; } team = first.id; }
+    if (el.ta && st.openId) st.drafts[st.openId] = el.ta.value;
+    st.openId = BOARD + team;
+    Y.openId = null;
+    U.ls.set('lastOpen.' + A.ws.id, st.openId);
+    st.editingId = null;
+    el.root.classList.remove('side-open');
+    UI.closePopover();
+    renderSidebar(); renderHeader(); renderKeyNotice(); buildComposer(); renderMessages(); renderPins();
+  }
+
   function openTeam(tid) {
     if (!A.teamList().some(t => t.id === tid)) return;
     if (el.ta && st.openId) st.drafts[st.openId] = el.ta.value;
@@ -2572,7 +2650,7 @@
         d.sub ? h('div', { class: 'notif-sub' }, d.sub) : null,
         actions.length ? h('div', { class: 'row notif-actions', style: { gap: '6px' } }, actions) : null),
       h('div', { class: 'notif-side' },
-        h('div', { class: 'notif-time', title: 'Arrived ' + new Date(it.at || it.ts).toLocaleString() }, U.formatDateTime(it.at || it.ts)),
+        h('div', { class: 'notif-time', title: 'Arrived ' + U.formatFull(it.at || it.ts) }, U.formatDateTime(it.at || it.ts)),
         unread ? h('span', { class: 'notif-dot', 'aria-label': 'Unread' }) : null));
     }
     function draw() {
@@ -2611,7 +2689,7 @@
 
   function notifSettingsDialog() {
     const prefs = N.prefs();
-    const cats = ['mentions', 'groups', 'requests'].concat(A.isOwner() ? ['admin'] : []);
+    const cats = ['mentions', 'groups', 'requests', 'board'].concat(A.isOwner() ? ['admin'] : []);
     const boxes = cats.map(k => {
       const cb = h('input', { type: 'checkbox', id: 'np-' + k, checked: prefs[k] !== false });
       cb.addEventListener('change', () => N.setPref(k, cb.checked));
@@ -2779,6 +2857,14 @@
 
   /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
   const NEWS = [
+    { version: '1.10.0', items: [
+      ['board', 'Project boards for each group', 'Sidebar → Project boards: PICKUP GROUP and INPUT GROUP each have their own board with four columns: Review, In progress, Checking and Done. Each card has the project number and name, priority, label (Input or Correction), members, progress, deadline and the superior who assigned it. Admins manage their group’s board; you see your own group’s.'],
+      ['check', 'Approve PICKUP projects', 'PICKUP admins approve a project in Done. It turns grey and goes to the INPUT GROUP board in Review. When an INPUT admin clicks Receive, it leaves the PICKUP board and PICKUP is told who received it.'],
+      ['archive', 'Confirm complete and History', 'On the INPUT board, Done is the last step: an admin clicks Confirm complete and the project leaves the board. Both groups find it under the second bell → History, with who approved, received and confirmed it.'],
+      ['boardBell', 'Board notifications, separate from chat', 'The second bell at the top left is only for projects: a new project assigned to you, and when yours moves to Checking or Done. The first bell stays for chat.'],
+      ['poll', 'One vote per poll', 'Everyone gets one vote in each poll. Pick another option to change it.'],
+      ['clock', 'Clearer times', 'Messages show “Today at 3:45 PM”, “Yesterday at…” and the weekday, like Facebook. Hover any time for the full date.'],
+    ] },
     { version: '1.9.0', items: [
       ['bell', 'Notifications', 'The bell at the top left collects mentions, replies, group changes and requests. Choose what pops up in ⚙ → Notification settings, or turn on Do not disturb.'],
       ['users', 'Groups in the sidebar', 'PICKUP GROUP and INPUT GROUP have their own section. Click one to see who’s in it and who’s online.'],

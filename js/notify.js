@@ -47,8 +47,8 @@
 
   /* ================= preferences ================= */
 
-  N.PREF_LABELS = { mentions: 'Mentions and replies', groups: 'Added to or removed from groups', requests: 'Requests and approvals', admin: 'Admin activity (super admin)' };
-  N.prefs = () => Object.assign({ mentions: true, groups: true, requests: true, admin: true }, U.ls.get(key('notifPrefs'), {}));
+  N.PREF_LABELS = { mentions: 'Mentions and replies', groups: 'Added to or removed from groups', requests: 'Requests and approvals', admin: 'Admin activity (super admin)', board: 'Project board: new projects, Checking and Done' };
+  N.prefs = () => Object.assign({ mentions: true, groups: true, requests: true, admin: true, board: true }, U.ls.get(key('notifPrefs'), {}));
   N.setPref = (k, on) => { const p = N.prefs(); p[k] = !!on; U.ls.set(key('notifPrefs'), p); };
   N.dndUntil = () => { const t = A.me ? U.ls.get(key('dnd'), 0) : 0; return t > Date.now() ? t : 0; };
   N.setDnd = until => { U.ls.set(key('dnd'), until || 0); N.events.emit('change'); };

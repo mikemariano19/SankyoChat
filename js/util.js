@@ -93,12 +93,27 @@
     if (d.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
     return d.toLocaleDateString([], opts);
   };
-  U.formatDateTime = ts => new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  /** Facebook style: "Today at 3:45 PM", "Yesterday at…", "Tomorrow at…", "Monday at…" (past week),
+   *  "November 12 at 3:45 PM" (this year), "November 12, 2025 at 3:45 PM" (older). */
+  U.formatDateTime = function (ts) {
+    const now = Date.now(), d = new Date(ts), t = U.formatTime(ts);
+    const day = U.localDay(ts);
+    if (day === U.localDay(now)) return 'Today at ' + t;
+    if (day === U.localDay(now - DAY_MS)) return 'Yesterday at ' + t;
+    if (day === U.localDay(now + DAY_MS)) return 'Tomorrow at ' + t;
+    if (ts < now && now - ts < 6 * DAY_MS) return d.toLocaleDateString([], { weekday: 'long' }) + ' at ' + t;
+    const opts = { month: 'long', day: 'numeric' };
+    if (d.getFullYear() !== new Date(now).getFullYear()) opts.year = 'numeric';
+    return d.toLocaleDateString([], opts) + ' at ' + t;
+  };
+  /** Full date for tooltips: "Wednesday, November 19, 2026 at 3:45 PM". */
+  U.formatFull = ts => new Date(ts).toLocaleDateString([], { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) + ' at ' + U.formatTime(ts);
+  /** Facebook style relative time: "just now", "5m ago", "3h ago" (today), then "Yesterday at 3:45 PM", etc. */
   U.relTime = function (ts) {
     const s = Math.round((Date.now() - ts) / 1000);
     if (s < 60) return 'just now';
-    if (s < 3600) return Math.floor(s / 60) + ' min ago';
-    if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400 && U.localDay(ts) === U.localDay(Date.now())) return Math.floor(s / 3600) + 'h ago';
     return U.formatDateTime(ts);
   };
 
