@@ -8,9 +8,9 @@
  *   data/board/<projectId>/<ts>_<userId>_<rand>.json
  * Each file is a signed, complete copy of the project at that moment: number, members, status, progress,
  * deadline, the superior who assigned it, and its place in the column. The newest valid file wins.
- * Every app ignores files whose signer wasn't an admin at that time (A.canActAt), and files signed by an
- * admin of another group (only the super admin works on every board), so nobody else can forge or move a
- * project. A project never changes board. Deleting a project writes one more file with deleted = true.
+ * Every app ignores files whose signer wasn't allowed to manage boards at that time (A.canAt 'board.manage'), and
+ * files signed by someone of another group (only the super admin, and custom roles whose board permission was set
+ * to "all groups" at the time, work on every board), so nobody else can forge or move a project. A project never changes board. Deleting a project writes one more file with deleted = true.
  *
  * Hand-off (PICKUP → INPUT): when a PICKUP project is Done, a PICKUP admin approves it. That writes
  * `approved = {by, ts}` and `handoff = <new project id>` on the PICKUP project, which is then locked, and
@@ -103,8 +103,11 @@
     };
   }
 
-  /** May this person write on this group's board? (Admin status is checked separately, per file.) */
-  const allowedOn = (uid, team) => !!A.ws && (uid === A.ws.adminId || (!!team && A.teamOf(uid) === team));
+  /** May the author of this file write on this group's board? (The board.manage permission itself is checked per file
+   *  in readProject.) Super admin: every board. Admins and "own group" roles: their own group's board. Custom roles
+   *  with board.manage set to "all groups" at the time of the file: every board. */
+  const allowedOn = (r, team) => !!A.ws && !!r && (r.userId === A.ws.adminId || (!!team && A.teamOf(r.userId) === team) ||
+    (!!team && A.roleScopeAt(r.userId, r.kid, r.ts, 'board.manage') === 'all'));
   /** pid → the revisions that count, after the group rules; the project's board is fixed by its first file. */
   const valid = new Map();
 
@@ -128,7 +131,7 @@
       if (!f) continue;
       let list = revs.get(pid);
       if (!list) revs.set(pid, list = []);
-      list.push(Object.assign({ id, pid, userId: raw.userId, ts: raw.ts }, f));
+      list.push(Object.assign({ id, pid, userId: raw.userId, kid: raw.kid, ts: raw.ts }, f));
       changed = true;
     }
     if (changed) revs.get(pid).sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : 1));
@@ -146,8 +149,8 @@
       // a hand-off: only valid if the PICKUP project names this one and the same admin approved it
       const src = source(first.from.pid);
       const appr = src && src.find(r => r.approved && r.handoff === first.pid);
-      ok = !!appr && B.HANDOFF[src.team] === team && appr.approved.by === first.userId && allowedOn(first.userId, src.team);
-    } else ok = allowedOn(first.userId, team);
+      ok = !!appr && B.HANDOFF[src.team] === team && appr.approved.by === first.userId && allowedOn(first, src.team);
+    } else ok = allowedOn(first, team);
     if (!ok) return [];
     const out = [Object.assign({}, first, { team })];
     // a hand-off waits until an admin of this board receives it; until then nothing else counts
@@ -156,7 +159,7 @@
       const last = out[out.length - 1];
       if (last.approved || last.completed) break; // approved and completed projects are locked
       if (r.team && r.team !== team) continue;
-      if (!allowedOn(r.userId, team)) continue;
+      if (!allowedOn(r, team)) continue;
       if (r.approved && (last.col !== 'done' || r.col !== 'done' || !B.HANDOFF[team])) continue;
       if (!got) { if (!r.received || r.received.by !== r.userId) continue; got = r.received; }
       // completing only counts on the last board (one that doesn't hand off), from Done, by whoever saved it

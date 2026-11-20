@@ -223,6 +223,17 @@
     if (tier !== 'role') return false;
     return roleStintsAt(userId, kid, ts).some(s => (s.perms || []).includes(perm) && scopeOk(s, perm, userId, ctx));
   };
+  /** For a custom-role holder at time ts: the scope of `perm` ('own' | 'all'), or '' if their role didn't have it. */
+  A.roleScopeAt = function (userId, kid, ts, perm) {
+    let best = '';
+    for (const s of roleStintsAt(userId, kid, ts)) {
+      if (!(s.perms || []).includes(perm) || A.PERM_TIER[perm] !== 'role') continue;
+      const sc = A.SCOPED_PERMS.includes(perm) && (s.scope || {})[perm] === 'all' ? 'all' : 'own';
+      if (sc === 'all') return 'all';
+      best = 'own';
+    }
+    return best;
+  };
   /** The role someone acted under at time ts, for the activity log. */
   A.roleNameAt = function (userId, kid, ts) {
     if (!A.ws) return '';
