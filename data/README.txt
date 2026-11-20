@@ -11,5 +11,8 @@ All messages live in this folder. Staff need Modify access here (and only here).
   inbox\                feedback for the super admin (encrypted)
   admin\                admin actions (renames, removals, resets), each signed by the admin
 
-Do not edit or rename files by hand. Back this folder up daily: a copy of it is a
-full backup (direct messages stay encrypted in the copy).
+Do not edit or rename files by hand. A copy of this folder is a full backup
+(direct messages stay encrypted in the copy).
+
+Hourly backups:   super admin, in the app: Admin settings -> Backups
+Folder emptied?   open the app: it offers to copy a backup back into this folder

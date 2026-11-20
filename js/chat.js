@@ -22,6 +22,27 @@
   /** close() of each open image/PDF viewer, so signing out or auto-lock never leaves one on screen */
   const viewers = new Set();
 
+  /* ---- roles (1.12): what my role lets me do ---- */
+  /** I can post or manage announcements (sees read counts and the announcement tools). */
+  const canAnnounce = () => A.canAny('ann.post', 'ann.private', 'ann.withdraw');
+  const article = w => (/^[aeiou]/i.test(w || '') ? 'an' : 'a');
+  /** Admin settings tabs I may open. */
+  const adminTabs = () => {
+    if (A.isOwner()) return ['people', 'roles', 'channels', 'activity', 'settings', 'backup', 'files'];
+    if (A.isAdmin()) return ['people', 'channels', 'activity'];
+    return [A.can('grp.accept') ? 'people' : null, A.can('ch.manage') ? 'channels' : null, A.can('log.view') ? 'activity' : null].filter(Boolean);
+  };
+  /** Tell me when the super admin changes my role. */
+  function noteRoleChange() {
+    const now = A.roleLabel(meId());
+    if (st.myRole === undefined || now === st.myRole) { st.myRole = now; return; }
+    st.myRole = now;
+    U.ls.del(`adminGuideSeen.${A.ws.id}.${meId()}`);
+    const guide = now === 'Admin' || now === 'Super admin' ? 'Admin guide' : 'Role guide';
+    UI.toast(now ? `You’re now ${article(now)} ${now}. See what you can do: ⚙ (bottom left) → ${guide}.` : 'Your role was removed. You’re regular staff now.', 'ok');
+    schedule('side', 'head', 'composer', 'msgs', 'banners');
+  }
+
   /** The Announcements channel isn't a real conversation; it has this reserved id. */
   const ANN = '@announcements';
   /* Announcements are split into feeds: the main one (everyone, and private ones to mixed people) and one per
@@ -98,7 +119,7 @@
         UI.toast(`You were removed from ${Y.info(ch).name}.`);
         if (ch.id === st.openId) { UI.closeAll(); Chat.open(Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys())[0]); }
       }),
-      Y.events.on('presence', changed => { schedule('side', 'head'); if (seenSig(cur()) !== st.seenSig || (isAnn() && changed && A.isAdmin()) || (isTeam() && changed)) schedule('msgs'); }),
+      Y.events.on('presence', changed => { schedule('side', 'head'); if (seenSig(cur()) !== st.seenSig || (isAnn() && changed && canAnnounce()) || (isTeam() && changed)) schedule('msgs'); }),
       N.events.on('change', () => { schedule('side'); if (st.inbox) st.inbox.draw(); }),
       N.events.on('open', () => notificationsDialog()),
       Y.events.on('connection', () => schedule('side', 'banners')),
@@ -107,9 +128,10 @@
       Y.events.on('incoming', onIncoming),
       Y.events.on('inbox', () => schedule('side')),
       Y.events.on('announcements', () => { schedule('side'); if (isAnn()) schedule('msgs'); showPendingAnnouncement(); }),
-      A.events.on('workspace', () => { leaveHiddenBoard(); schedule('side', 'head', 'composer', 'msgs', 'banners'); if (A.isRemoved(meId())) SC.app.lock('Your account was removed by the admin.'); else askTeamIfNeeded(); }),
+      A.events.on('workspace', () => { noteRoleChange(); leaveHiddenBoard(); schedule('side', 'head', 'composer', 'msgs', 'banners'); if (A.isRemoved(meId())) SC.app.lock('Your account was removed by the admin.'); else askTeamIfNeeded(); }),
       A.events.on('users', () => { schedule('side', 'head', 'msgs', 'banners'); askTeamIfNeeded(); }),
       A.events.on('wsTampered', () => { st.banners.wsTampered = true; schedule('banners'); }),
+      SC.backup.onChange(() => schedule('banners')),
     ];
     const last = U.ls.get('lastOpen.' + A.ws.id);
     const teamOk = typeof last === 'string' && last.startsWith(TEAM) && A.teamList().some(t => TEAM + t.id === last);
@@ -121,8 +143,11 @@
     showPendingAnnouncement();
     renderBanners();
     if (!askTeamIfNeeded()) askSetupIfNeeded().then(shown => { if (!shown && el.root) showWhatsNew(); });
+    st.myRole = A.roleLabel(meId());
     if (A.isAdmin() && !U.ls.get(`adminGuideSeen.${A.ws.id}.${meId()}`)) {
       setTimeout(() => { if (el.root) UI.toast('You’re an admin. See what you can do: ⚙ (bottom left) → Admin guide.'); }, 3000);
+    } else if (A.hasCustomRole() && !U.ls.get(`adminGuideSeen.${A.ws.id}.${meId()}`)) {
+      setTimeout(() => { if (el.root) UI.toast(`You’re ${article(st.myRole)} ${st.myRole}. See what you can do: ⚙ (bottom left) → Role guide.`); }, 3000);
     }
   };
 
@@ -220,7 +245,7 @@
       const tid = TEAM + t.id;
       const active = st.openId === tid;
       const members = A.teamMembers(t.id);
-      const waiting = A.isAdmin() ? A.teamPending().filter(u => A.teamRequest(u.id) === t.id).length : 0;
+      const waiting = A.teamPendingForMe().filter(u => A.teamRequest(u.id) === t.id).length;
       const mine = A.teamOf(meId()) === t.id;
       return h('button', { class: 'side-item team-item' + (active ? ' active' : ''), 'data-open': tid, 'data-key': 'ch:' + tid, 'aria-current': active ? 'page' : null,
         'aria-label': `${t.name}, ${members.length} ${members.length === 1 ? 'member' : 'members'}` + (mine ? ', your group' : '') + (waiting ? `, ${waiting} waiting for acceptance` : '') },
@@ -264,7 +289,7 @@
         teamRows,
         h('div', { class: 'side-sec' }, h('span', null, 'Project boards')),
         boardRows.length ? boardRows : h('div', { class: 'side-empty' }, 'Your board appears once an admin accepts your group'),
-        h('div', { class: 'side-sec' }, h('span', null, 'Channels'), A.isAdmin() ? h('button', { class: 'icon-btn', 'data-act': 'new-channel', 'data-key': 'newch', 'aria-label': 'Create a channel', title: 'Create a channel' }, icon('plus')) : null),
+        h('div', { class: 'side-sec' }, h('span', null, 'Channels'), A.canAny('ch.create', 'ch.createPrivate') ? h('button', { class: 'icon-btn', 'data-act': 'new-channel', 'data-key': 'newch', 'aria-label': 'Create a channel', title: 'Create a channel' }, icon('plus')) : null),
         pub.map(item),
         h('div', { class: 'side-sec' }, h('span', null, 'Group chats'), h('span', { class: 'row', style: { gap: '0' } },
           h('button', { class: 'icon-btn', 'data-act': 'browse-groups', 'data-key': 'browse', 'aria-label': 'Browse groups you can ask to join', title: 'Browse groups' }, icon('search')),
@@ -291,7 +316,7 @@
     if (t.dataset.open) return Chat.open(t.dataset.open);
     switch (t.dataset.act) {
       case 'jump': return quickSwitcher();
-      case 'new-channel': return A.isAdmin() ? newChannelDialog() : null;
+      case 'new-channel': return A.canAny('ch.create', 'ch.createPrivate') ? newChannelDialog() : null;
       case 'new-dm': return newMessageDialog();
       case 'new-group': return newGroupDialog();
       case 'browse-groups': return browseGroupsDialog();
@@ -436,7 +461,22 @@
         h('span', null, h('b', null, 'Update mode is on. '), 'Everyone else is disconnected and waiting. Copy the new app files onto the share (never over the data folder), then click Finish update.'),
         h('button', { class: 'btn btn-sm btn-primary', onclick: () => finishUpdate() }, 'Finish update')));
     }
-    const waiting = A.isAdmin() ? A.teamPending() : [];
+    if (A.isOwner()) {
+      const bk = SC.backup.state();
+      if (bk.status === 'needsPermission' || bk.status === 'error') {
+        const btn = h('button', { class: 'btn btn-sm btn-primary' }, bk.status === 'needsPermission' ? 'Allow' : 'Try again');
+        btn.addEventListener('click', () => UI.busy(btn, null, async () => { const r = await SC.backup.runNow({ ask: true }); if (r) UI.toast(`Backed up ${r.files} files`, 'ok'); }));
+        list.push(h('div', { class: 'banner', role: 'alert' }, icon('alert'), h('span', null,
+          h('b', null, bk.status === 'needsPermission' ? 'Backups are paused. ' : 'The last backup failed. '),
+          bk.status === 'needsPermission' ? `The browser needs your OK to open the backup folder “${bk.folder}”. Choose “Allow on every visit”.` : bk.error), btn));
+      } else if (bk.status === 'off' && !(U.ls.get('backupNagUntil', 0) > Date.now())) {
+        list.push(h('div', { class: 'banner info', role: 'status' }, icon('shield'),
+          h('span', null, h('b', null, 'Backups aren’t set up. '), 'If the data folder is deleted, every account and message is lost. Choose a backup folder on the shared storage.'),
+          h('button', { class: 'btn btn-sm btn-primary', onclick: () => adminDialog('backup') }, 'Set up'),
+          h('button', { class: 'btn btn-sm', onclick: () => { U.ls.set('backupNagUntil', Date.now() + 7 * 86400000); schedule('banners'); } }, 'Later')));
+      }
+    }
+    const waiting = A.teamPendingForMe();
     if (waiting.length) {
       list.push(h('div', { class: 'banner info', role: 'status' }, icon('users'),
         h('span', null, h('b', null, waiting.length === 1 ? `${waiting[0].name} is waiting for their group to be accepted. ` : `${waiting.length} people are waiting for their group to be accepted. `),
@@ -646,7 +686,7 @@
         Y.canPin(ch) ? h('button', { class: 'icon-btn' + (pinned ? ' active' : ''), 'data-action': 'pin', 'aria-label': pinned ? 'Unpin' : 'Pin', title: pinned ? 'Unpin' : 'Pin to the top' }, icon('pin')) : null,
         mine && !m.poll ? h('button', { class: 'icon-btn', 'data-action': 'edit', 'aria-label': 'Edit', title: 'Edit' }, icon('edit')) : null,
         mine ? h('button', { class: 'icon-btn', 'data-action': 'delete', 'aria-label': 'Delete', title: 'Delete' }, icon('trash')) : null,
-        A.isAdmin() && ch.kind === 'public' && !mine ? h('button', { class: 'icon-btn', 'data-action': 'hide', 'aria-label': 'Hide message (admin)', title: 'Hide message (admin)' }, icon('eyeOff')) : null);
+        A.can('msg.hide') && ch.kind === 'public' && !mine ? h('button', { class: 'icon-btn', 'data-action': 'hide', 'aria-label': 'Hide message', title: 'Hide message for everyone' }, icon('eyeOff')) : null);
       body.appendChild(tools);
     }
     return row;
@@ -1080,13 +1120,13 @@
         h('span', { class: 'row', style: { gap: '8px' } },
           h('button', { class: 'btn', disabled: !ids.length || ids.length + 1 > Y.MAX_GROUP, title: ids.length + 1 > Y.MAX_GROUP ? `Group chats can have up to ${Y.MAX_GROUP} people` : null,
             onclick: () => newGroupDialog({ name: A.teamName(tid), userIds: ids }) }, icon('message'), 'Start group chat with everyone'),
-          A.isAdmin() && (Y.announceTeam() === null || Y.announceTeam() === tid) ? h('button', { class: 'btn btn-primary', disabled: !ids.length, onclick: () => newAnnouncementDialog({ team: tid }) }, icon('megaphone'), 'Send announcement to this group') : null)));
+          A.can('ann.private') && (Y.announceTeam() === null || Y.announceTeam() === tid) ? h('button', { class: 'btn btn-primary', disabled: !ids.length, onclick: () => newAnnouncementDialog({ team: tid }) }, icon('megaphone'), 'Send announcement to this group') : null)));
       return;
     }
     if (isAnn()) {
       el.ta = null;
       const f = annFeed();
-      const canPost = A.isAdmin() && (!f || Y.announceTeam() === null || Y.announceTeam() === f);
+      const canPost = (f ? A.can('ann.private') : A.canAny('ann.post', 'ann.private')) && (!f || Y.announceTeam() === null || Y.announceTeam() === f);
       UI.set(el.composerWrap, canPost
         ? h('div', { class: 'ann-compose' }, h('span', { class: 'muted' }, f ? `Only people in ${A.teamName(f)} get these. They pop up and stay here for a year.` : 'Announcements pop up for everyone and stay here for a year.'),
           h('button', { class: 'btn btn-primary', onclick: () => newAnnouncementDialog(f ? { team: f } : {}) }, icon('megaphone'), f ? `New announcement to ${shortTeam(f)}` : 'New announcement'))
@@ -1119,7 +1159,7 @@
         el.chips,
         h('div', { class: 'comp-row' }, ta, emojiBtn,
           h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Attach files (max 5 MB each)', title: 'Attach files', onclick: () => fileInput.click() }, icon('clip')),
-          A.isAdmin() ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Create a poll', title: 'Create a poll', onclick: () => pollDialog(ch) }, icon('poll')) : null,
+          A.can('msg.poll') ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Create a poll', title: 'Create a poll', onclick: () => pollDialog(ch) }, icon('poll')) : null,
           el.sendBtn, fileInput)),
       h('div', { class: 'comp-hint' }, el.hintLeft, el.count));
     ta.addEventListener('input', () => { st.drafts[ch.id] = ta.value; autosize(ta); updateCount(); mentionCheck(); });
@@ -1369,7 +1409,8 @@
     const preview = h('div', { class: 'hint' });
     name.addEventListener('input', () => { const n = Y.normalizeChannelName(name.value); preview.textContent = n ? `Will be created as #${n}` : 'Lowercase letters, numbers and dashes.'; });
     name.dispatchEvent(new Event('input'));
-    let priv = !!preset.private;
+    const canPubCh = A.can('ch.create'), canPrivCh = A.can('ch.createPrivate') || !!preset.replaces;
+    let priv = !!preset.private || !canPubCh;
     const count = h('div', { class: 'hint' });
     const ok = h('button', { class: 'btn btn-primary', type: 'submit' });
     const update = () => {
@@ -1383,7 +1424,7 @@
     const note = h('p', { class: 'muted', style: { fontSize: '14px' } });
     const seg = h('div', { class: 'vis-seg', role: 'radiogroup', 'aria-label': 'Who can see it' });
     const drawSeg = () => {
-      UI.set(seg, [['public', 'hash', 'Public', 'Everyone in the workspace'], ['private', 'lock', 'Private', 'Only people you invite']].map(([v, ic, t, sub]) =>
+      UI.set(seg, [['public', 'hash', 'Public', 'Everyone in the workspace'], ['private', 'lock', 'Private', 'Only people you invite']].filter(([v]) => (v === 'public' ? canPubCh : canPrivCh)).map(([v, ic, t, sub]) =>
         h('button', { type: 'button', role: 'radio', 'aria-checked': String(priv === (v === 'private')), onclick: () => { priv = v === 'private'; drawSeg(); } },
           icon(ic), h('span', null, h('b', null, t), h('span', { class: 'sub' }, sub)))));
       invite.classList.toggle('hidden', !priv);
@@ -1550,7 +1591,7 @@
         h('dt', null, 'Members'), h('dd', null, 'Everyone in the workspace'),
         h('dt', null, 'Privacy'), h('dd', null, 'Public. Stored unencrypted on the shared drive.')));
       const actions = [muteBtn];
-      if (A.isAdmin()) {
+      if (A.can('ch.manage')) {
         actions.push(
           h('button', { class: 'btn', onclick: async () => {
             const v = await UI.prompt({ title: 'Rename channel', label: 'New name', value: info.name, maxlength: 40, onOk: async val => {
@@ -1569,8 +1610,10 @@
             if (!info.archived && !(await UI.confirm({ title: `Archive #${info.name}?`, text: 'It disappears from the sidebar and nobody can post. History stays, and you can unarchive it later from Admin settings.', ok: 'Archive' }))) return;
             try { await A.setChannelOverride(ch.id, { archived: !info.archived }); m.close(); if (!info.archived) Chat.open('general'); } catch (e) { UI.toast(e.message, 'error'); }
           } }, icon('archive'), info.archived ? 'Unarchive' : 'Archive') : null,
-          h('button', { class: 'btn', onclick: () => exportChannel(ch) }, icon('download'), 'Export history'),
-          ch.id !== 'general' && !info.archived ? h('button', { class: 'btn', onclick: () => { m.close(); makePrivateDialog(ch); } }, icon('lock'), 'Make private') : null);
+          h('button', { class: 'btn', onclick: () => exportChannel(ch) }, icon('download'), 'Export history'));
+      }
+      if (A.can('ch.makePrivate') && ch.id !== 'general' && !info.archived) {
+        actions.push(h('button', { class: 'btn', onclick: () => { m.close(); makePrivateDialog(ch); } }, icon('lock'), 'Make private'));
       }
       body.push(h('div', { class: 'row', style: { flexWrap: 'wrap' } }, actions));
     } else {
@@ -1745,8 +1788,8 @@
       item('key', 'Security question', recoveryDialog),
       item('shield', 'Privacy and security: who can read what', () => privacyDialog()),
       item('megaphone', 'What’s new', () => whatsNewDialog()),
-      A.isAdmin() ? item('info', 'Admin guide: what you can do', adminGuide) : null,
-      A.isAdmin() ? item('shield', 'Admin settings', adminDialog) : null,
+      A.isAdmin() ? item('info', 'Admin guide: what you can do', adminGuide) : A.hasCustomRole() ? item('info', 'Role guide: what you can do', adminGuide) : null,
+      adminTabs().length ? item('shield', 'Admin settings', adminDialog) : null,
       item('lock', 'Lock (sign out)', () => SC.app.lock()),
       h('div', { class: 'menu-foot' }, `Sankyo Chat ${SC.VERSION}` + (A.keepSignedIn() ? ' · kept signed in' : ` · locks after ${A.autoLockMinutes() || '—'} min idle`)),
     ], { placement: 'right-up', label: 'Profile and settings' });
@@ -1927,7 +1970,7 @@
   function renderAnnouncements() {
     const box = el.msgs;
     if (!box) return;
-    const admin = A.isAdmin();
+    const admin = canAnnounce();
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
     const keepTop = box.scrollTop;
     const openReach = new Set(Array.from(box.querySelectorAll('details[open]')).map(d => d.closest('[data-ann]')).filter(Boolean).map(r => r.dataset.ann));
@@ -1971,7 +2014,7 @@
             // shown on hover (and keyboard focus) at the card's corner, like the tools on chat messages
             admin ? h('div', { class: 'msg-tools ann-tools', role: 'toolbar', 'aria-label': 'Announcement actions' },
               Y.canEditAnnouncement(a) ? h('button', { class: 'icon-btn', 'data-action': 'ann-edit', 'aria-label': 'Edit announcement', title: 'Edit (fix a mistake; it doesn’t pop up again)' }, icon('edit')) : null,
-              h('button', { class: 'icon-btn', 'data-action': 'ann-withdraw', 'aria-label': 'Delete announcement', title: 'Delete for everyone' }, icon('trash'))) : null))));
+              A.can('ann.withdraw') || Y.canEditAnnouncement(a) ? h('button', { class: 'icon-btn', 'data-action': 'ann-withdraw', 'aria-label': 'Delete announcement', title: 'Delete for everyone' }, icon('trash')) : null) : null))));
     }
     UI.set(box, frag);
     if (st.firstRender || atBottom) {
@@ -1992,7 +2035,7 @@
     const row = t.closest('[data-ann]');
     if (!row) return;
     if (t.dataset.action === 'profile') { const a = Y.announcements.get(row.dataset.ann); if (a) profileCard(a.userId, t); return; }
-    if (!A.isAdmin()) return;
+    if (!canAnnounce()) return;
     if (t.dataset.action === 'ann-edit') return editAnnouncementDialog(Y.announcements.get(row.dataset.ann));
     if (t.dataset.action !== 'ann-withdraw') return;
     if (!(await UI.confirm({ title: 'Delete this announcement?', text: 'It disappears for everyone, including people who haven’t seen it yet. This can’t be undone.', ok: 'Delete', danger: true }))) return;
@@ -2069,7 +2112,8 @@
     const err = h('div', { class: 'form-error hidden', role: 'alert' });
     const title = h('input', { class: 'input', id: 'an-title', maxlength: 120, placeholder: 'e.g. Office closed on Friday' });
     const text = h('textarea', { class: 'input', id: 'an-text', rows: 6, maxlength: String(Y.MAX_TEXT), placeholder: 'What do people need to know?' });
-    let priv = false;
+    const canPub = A.can('ann.post'), canPriv = A.can('ann.private');
+    let priv = !canPub;
     const ok = h('button', { class: 'btn btn-primary' }, icon('megaphone'));
     // admins can only send private announcements inside their own group; the super admin to anyone
     const scope = Y.announceTeam();
@@ -2130,7 +2174,7 @@
     const hint = h('div', { class: 'hint' });
     const seg = h('div', { class: 'vis-seg', role: 'radiogroup', 'aria-label': 'Who gets it' });
     const drawSeg = () => {
-      UI.set(seg, [['all', 'users', 'Everyone', 'All staff in the workspace'], ['private', 'lock', 'Chosen people', 'Only them, encrypted']].map(([v, ic, t, sub]) =>
+      UI.set(seg, [['all', 'users', 'Everyone', 'All staff in the workspace'], ['private', 'lock', 'Chosen people', 'Only them, encrypted']].filter(([v]) => (v === 'all' ? canPub : canPriv)).map(([v, ic, t, sub]) =>
         h('button', { type: 'button', role: 'radio', 'aria-checked': String(priv === (v === 'private')), onclick: () => { priv = v === 'private'; drawSeg(); } },
           icon(ic), h('span', null, h('b', null, t), h('span', { class: 'sub' }, sub)))));
       people.classList.toggle('hidden', !priv);
@@ -2260,42 +2304,48 @@
     const where = t => h('span', { class: 'guide-where' }, t);
     const sections = [
       ['Announcements', 'megaphone', [
-        ['Post to everyone', 'A pop-up for all staff, kept in Announcements for a year. You can see who has read it.', openIn('New announcement', newAnnouncementDialog)],
-        ['Announce privately', 'Send it only to chosen people (encrypted for them). Use “Add everyone in…” to send to a whole private channel or group at once.', openIn('New announcement', newAnnouncementDialog)],
-        ['Withdraw an announcement', 'It disappears for everyone.', where('Announcements → hover it → 🗑')],
+        ['Post to everyone', 'A pop-up for all staff, kept in Announcements for a year. You can see who has read it.', openIn('New announcement', newAnnouncementDialog), 'ann.post'],
+        ['Announce privately', 'Send it only to chosen people (encrypted for them). Use “Add everyone in…” to send to a whole private channel or group at once.', openIn('New announcement', newAnnouncementDialog), 'ann.private'],
+        ['Withdraw an announcement', 'It disappears for everyone.', where('Announcements → hover it → 🗑'), 'ann.withdraw'],
       ]],
       ['Channels', 'hash', [
-        ['Create a public channel', 'Everyone can read and post.', openIn('Create a channel', () => newChannelDialog())],
-        ['Create a private channel', `Invite-only and encrypted, up to ${Y.MAX_GROUP} people. History is kept. Not even other admins can read it unless invited.`, openIn('Create a private channel', () => newChannelDialog({ private: true }))],
-        ['Make a channel private', 'Creates a private copy for the people you choose and archives the public one.', where('Channel → ⓘ Details → Make private')],
-        ['Invite or remove people in a private channel', 'The creator and channel admins manage members; the creator picks channel admins.', where('Private channel → ⓘ Details → Add people / Remove')],
-        ['Rename, describe, archive, export', 'Archived channels stay readable from Admin settings → Channels.', where('Channel → ⓘ Details')],
+        ['Create a public channel', 'Everyone can read and post.', openIn('Create a channel', () => newChannelDialog()), 'ch.create'],
+        ['Create a private channel', `Invite-only and encrypted, up to ${Y.MAX_GROUP} people. History is kept. Not even other admins can read it unless invited.`, openIn('Create a private channel', () => newChannelDialog({ private: true })), 'ch.createPrivate'],
+        ['Make a channel private', 'Creates a private copy for the people you choose and archives the public one.', where('Channel → ⓘ Details → Make private'), 'ch.makePrivate'],
+        ['Invite or remove people in a private channel', 'The creator and channel admins manage members; the creator picks channel admins.', where('Private channel → ⓘ Details → Add people / Remove'), 'ch.createPrivate'],
+        ['Rename, describe, archive, export', 'Archived channels stay readable from Admin settings → Channels.', where('Channel → ⓘ Details'), 'ch.manage'],
       ]],
       ['In conversations', 'message', [
-        ['Create a poll', 'In any conversation you’re in. Everyone gets one vote and can change it.', where('Chart button next to 📎 in the message box')],
-        ['Pin messages', 'Shown in a bar at the top of the channel. Group creators and group admins can pin in their groups too.', where('Hover a message → 📌')],
-        ['Hide a message in a channel', 'Everyone sees “Message hidden by the admin”.', where('Hover a message → eye icon')],
+        ['Create a poll', 'In any conversation you’re in. Everyone gets one vote and can change it.', where('Chart button next to 📎 in the message box'), 'msg.poll'],
+        ['Pin messages', 'Shown in a bar at the top of the channel. Group creators and group admins can pin in their groups too.', where('Hover a message → 📌'), 'msg.pin'],
+        ['Hide a message in a channel', 'Everyone sees “Message hidden”.', where('Hover a message → eye icon'), 'msg.hide'],
       ]],
-      ['Groups', 'users', [
-        ['Accept someone’s group', 'Everyone picks a group when they make their profile. It only counts once an admin accepts it, so a wrong pick never shows them another group’s messages.', openIn('Review groups', () => adminDialog('people'))],
-        ['Move someone to another group', 'If they picked the wrong one, put them in the right group.', where('Admin settings → People → Change')],
-        ['Announce to one group', 'New announcement → Chosen people → Group name.', openIn('New announcement', newAnnouncementDialog)],
+      ['Groups and project boards', 'users', [
+        ['Accept someone’s group', A.ownGroupOnly('grp.accept') ? `Only for ${A.teamName(A.teamOf(meId())) || 'your own group'}. A group only counts once it’s accepted, so a wrong pick never shows someone another group’s messages.` : 'Everyone picks a group when they make their profile. It only counts once it’s accepted, so a wrong pick never shows them another group’s messages.', openIn('Review groups', () => adminDialog('people')), 'grp.accept'],
+        ['Move someone to another group', 'If they picked the wrong one, put them in the right group.', where('Admin settings → People → Change'), 'grp.accept'],
+        ['Manage the project board', A.ownGroupOnly('board.manage') ? 'Create, assign, move, approve and receive projects on your group’s board.' : 'Create, assign, move, approve and receive projects on every group’s board.', where('Sidebar → Project boards'), 'board.manage'],
+        ['Announce to one group', 'New announcement → Chosen people → Group name.', openIn('New announcement', newAnnouncementDialog), 'ann.private'],
       ]],
       ['People', 'users', [
-        ['Reset a password', 'Gives them a temporary password. Their direct messages from before the reset can’t be opened any more.', openIn('Admin settings', adminDialog)],
-        ['Remove someone', 'They can’t sign in any more and disappear from the sign-in list. Their channel messages stay.', openIn('Admin settings', adminDialog)],
-        ['See what admins did', 'Every rename, archive, reset and removal, with who did it.', where('Admin settings → Activity')],
+        ['Reset a password', 'Gives them a temporary password. Their direct messages from before the reset can’t be opened any more.', openIn('Admin settings', adminDialog), 'ppl.reset'],
+        ['Remove someone', 'They can’t sign in any more and disappear from the sign-in list. Their channel messages stay.', openIn('Admin settings', adminDialog), 'ppl.remove'],
+        ['See what admins did', 'Every rename, archive, reset and removal, with who did it.', where('Admin settings → Activity'), 'log.view'],
       ]],
-    ];
+    ].map(([title, ic, rows]) => [title, ic, rows.filter(r => A.can(r[3]))]).filter(([, , rows]) => rows.length);
+    const custom = !A.isAdmin() && A.customRoleOf(meId());
     if (owner) sections.push(['Only you, the super admin', 'shield', [
+      ['Roles and permissions', 'See what every role can do, create roles like Moderator, and give them to people. Only you can.', openIn('Roles', () => adminDialog('roles'))],
       ['Appoint or remove admins', 'Admins can do everything above. They can’t manage other admins.', openIn('Admin settings', adminDialog)],
       ['Workspace settings', 'Workspace name and auto-lock time.', where('Admin settings → Settings')],
       ['Feedback inbox', 'Staff feedback, encrypted so only you can read it.', where('Sidebar → Feedback inbox')],
       ['Check the app files', 'Detects if anyone changed the app’s code on the shared drive.', where('Admin settings → App files')],
       ['Security question', 'Lets you recover your own password. Nobody else can reset yours.', openIn('Set it', recoveryDialog)],
     ]]);
-    const m = UI.modal({ title: owner ? 'Super admin guide' : 'Admin guide', cls: 'mid guide', body: [
-      h('p', { class: 'muted', style: { marginTop: 0 } }, 'What you can do as ' + (owner ? 'the super admin' : 'an admin') + '. Click a button to try it, or follow the hint.'),
+    const m = UI.modal({ title: owner ? 'Super admin guide' : custom ? 'Role guide' : 'Admin guide', cls: 'mid guide', body: [
+      h('p', { class: 'muted', style: { marginTop: 0 } }, 'What you can do as ' + (owner ? 'the super admin' : custom ? `${article(custom.name)} ${custom.name}` : 'an admin') + '. Click a button to try it, or follow the hint.'),
+      custom ? h('div', { class: 'note note-info' }, icon('shield'), h('div', null, h('b', null, `${custom.name}${custom.desc ? ': ' + custom.desc : ''}`),
+        h('div', null, 'The super admin chose these rights for your role. Password resets, removing people and real names stay with admins.'))) : null,
+      sections.length ? null : h('p', null, 'Your role has no permissions right now.'),
       sections.map(([title, ic, rows]) => h('section', { class: 'guide-sec' },
         h('h3', null, icon(ic), title),
         rows.map(([t, d, action]) => h('div', { class: 'guide-row' }, h('div', null, h('div', { class: 'guide-t' }, t), h('div', { class: 'guide-d' }, d)), action)))),
@@ -2306,44 +2356,86 @@
 
   /* ---- admin ---- */
   function adminDialog(start) {
-    let tab = typeof start === 'string' ? start : 'people';
+    const allowed = adminTabs();
+    if (!allowed.length) return;
+    let tab = typeof start === 'string' && allowed.includes(start) ? start : allowed[0];
     const tabs = h('div', { class: 'tabs', role: 'tablist' });
     const panel = h('div', { role: 'tabpanel' });
     const tabBtn = (id, label) => h('button', { role: 'tab', 'aria-selected': String(tab === id), onclick: () => { tab = id; draw(); } }, label);
     const owner = A.isOwner();
+    const LABELS = { people: 'People', roles: 'Roles', channels: 'Channels', activity: 'Activity', settings: 'Settings', backup: 'Backups', files: 'App files' };
     function draw() {
-      UI.set(tabs, tabBtn('people', 'People'), tabBtn('channels', 'Channels'), tabBtn('activity', 'Activity'),
-        owner ? tabBtn('settings', 'Settings') : null, owner ? tabBtn('files', 'App files') : null);
-      UI.set(panel, ({ people, channels, activity, settings, files })[tab]());
+      UI.set(tabs, allowed.map(id => tabBtn(id, LABELS[id])));
+      UI.set(panel, ({ people, roles, channels, activity, settings, backup, files })[tab]());
     }
+    function backup() {
+      const BK = SC.backup;
+      const s = BK.state();
+      const err = h('div', { class: 'form-error hidden', role: 'alert' });
+      const when = ts => new Date(ts).toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+      const statusText = {
+        off: 'Off: no backup folder chosen on this PC',
+        ok: 'On: checks every hour while you’re signed in, and saves only what changed',
+        running: 'Backing up now…' + (s.progress ? ' ' + s.progress : ''),
+        needsPermission: 'Paused: the browser needs your OK to open the backup folder',
+        error: 'Last backup failed',
+      }[s.status] || 'Checking…';
+      const choose = h('button', { class: 'btn' + (s.folder ? '' : ' btn-primary') }, icon('folder'), s.folder ? 'Change backup folder' : 'Choose backup folder');
+      choose.addEventListener('click', () => UI.busy(choose, null, async () => { if (await BK.choose()) UI.toast('Backup folder saved. Today’s backup is done.', 'ok'); draw(); }, err));
+      const now = s.folder ? h('button', { class: 'btn btn-primary' }, icon(s.status === 'needsPermission' ? 'key' : 'download'), s.status === 'needsPermission' ? 'Allow and back up now' : 'Back up now') : null;
+      if (now) now.addEventListener('click', () => UI.busy(now, 'Backing up…', async () => { const r = await BK.runNow({ ask: true }); if (r) UI.toast(r.changed ? `Backed up ${r.changed} changed file${r.changed === 1 ? '' : 's'} into ${r.name}` : 'Nothing changed since the last backup', 'ok'); draw(); }, err));
+      const off = s.folder ? h('button', { class: 'btn btn-danger' }, 'Turn off') : null;
+      if (off) off.addEventListener('click', async () => {
+        if (!(await UI.confirm({ title: 'Turn off backups?', ok: 'Turn off', danger: true, text: 'This PC stops checking for changes. Backups already in the folder are kept. (The Windows task, if you set one up, keeps running.)' }))) return;
+        await BK.turnOff(); draw();
+      });
+      return h('div', null, err,
+        h('p', { class: 'muted', style: { fontSize: '14px' } }, 'Every hour the app compares the data folder with today’s backup. If nothing changed, nothing is written. If something changed, the new and changed files are copied into today’s folder (data-YYYY-MM-DD), and each new day gets a new folder. Files are never deleted from a day’s backup. If the data folder is ever emptied or deleted, the app asks for a backup when it opens and copies it back into data, so it keeps working on its own copy and the backup stays as it is.'),
+        h('dl', { class: 'kv' },
+          h('dt', null, 'Backup folder'), h('dd', null, s.folder || 'Not chosen'),
+          h('dt', null, 'Status'), h('dd', null, statusText),
+          s.error && s.status === 'error' ? [h('dt', null, 'Error'), h('dd', null, s.error)] : null,
+          h('dt', null, 'Last checked'), h('dd', null, s.lastCheck ? when(s.lastCheck) : 'Not yet'),
+          h('dt', null, 'Last change saved'), h('dd', null, s.last ? `${when(s.last.ts)} · ${s.last.name}${s.last.changed ? ` · ${s.last.changed} file${s.last.changed === 1 ? '' : 's'} updated` : ''}${s.last.bytes != null ? ` · ${BK.formatSize(s.last.bytes)} in all` : ''}` : 'None yet'),
+          h('dt', null, 'Kept'), h('dd', null, `One folder per day, for ${BK.KEEP_DAYS} days`)),
+        h('div', { class: 'note note-info' }, icon('alert'), h('div', null,
+          h('b', null, 'Pick a folder outside the SankyoChat folder, '), 'e.g. make “SankyoChat-Backups” next to it on the shared storage. Then deleting the app folder or the data folder can’t delete the backups. ',
+          h('b', null, 'When your app is closed, '), 'the browser can’t back up. To keep backing up then, set up the Windows task once on the file server or a PC that’s always on: double-click ', h('code', null, 'backup\\1 Set up hourly backup.bat'), ' in the SankyoChat folder and give it the same backup folder. It writes the same daily folders, and also runs when nobody is signed in to Windows.')),
+        h('div', { class: 'row', style: { gap: '8px', flexWrap: 'wrap', marginTop: '12px' } }, choose, now, off));
+    }
+    function roles() { return SC.rolesUI.render(draw); }
     function people() {
+      const RU = SC.rolesUI;
       // people waiting for their group first, then by name
       const users = Array.from(A.users.values()).sort((a, b) => (!!A.teamRequest(b.id) - !!A.teamRequest(a.id)) || a.name.localeCompare(b.name));
+      const mine = A.teamName(A.teamOf(meId()));
       const intro = h('p', { class: 'muted', style: { fontSize: '14px' } }, owner
-        ? 'You are the super admin. Admins you appoint can create, rename and archive channels, hide messages, and reset passwords or remove regular staff. Only you can appoint admins, change workspace settings and read feedback.'
-        : 'As an admin you can reset passwords and remove regular staff. Only the super admin can manage admins.');
-      return h('div', null, intro, h('table', { class: 'table' }, h('thead', null, h('tr', null, h('th', null, 'Person'), h('th', null, 'Group'), h('th', null, 'Status'), h('th', null, 'Joined'), h('th', null, ''))),
+        ? 'You are the super admin. Give each person a role here: Staff, Admin, or a role you made in the Roles tab. There’s always exactly one super admin; Admin and custom roles have no limit.'
+        : A.isAdmin() ? 'As an admin you can reset passwords and remove regular staff. Only the super admin can change roles.'
+          : A.ownGroupOnly('grp.accept') ? `Your role lets you accept and move people for ${mine || 'your own group'}.` : 'Your role lets you accept people’s groups and move them between groups.');
+      return h('div', null, intro, h('table', { class: 'table' }, h('thead', null, h('tr', null, h('th', null, 'Person'), h('th', null, 'Role'), h('th', null, 'Group'), h('th', null, 'Status'), h('th', null, 'Joined'), h('th', null, ''))),
         h('tbody', null, users.map(u => {
           const removed = A.isRemoved(u.id);
           const p = Y.presenceOf(u.id);
           const role = A.roleLabel(u.id);
           const isAdm = A.isUserAdmin(u.id);
           const canManage = u.id !== meId() && !removed && u.id !== A.ws.adminId && (owner || !isAdm);
-          return h('tr', null,
-            h('td', null, h('span', { class: 'row' }, UI.avatar(u, 28), u.name, role ? h('span', { class: 'pill' + (u.id === A.ws.adminId ? '' : ' grey') }, role) : null)),
+          const canTeam = !removed && A.canAcceptTeam(u.id);
+          return h('tr', { class: owner && RU.rowDirty(u.id) ? 'rl-dirty' : null },
+            h('td', null, h('span', { class: 'row' }, UI.avatar(u, 28), u.name)),
+            h('td', null, removed ? '—' : owner ? RU.roleSelect(u, draw) : role ? h('span', { class: 'rl-pill', style: { '--rc': A.roleColorOf(u.id) || 'var(--muted)' } }, role) : h('span', { class: 'muted' }, 'Staff')),
             h('td', { class: 'team-cell' }, removed ? '—' : [
               h('div', null, A.teamName(A.teamOf(u.id)) || h('span', { class: 'muted' }, 'None')),
               A.teamRequest(u.id) ? h('div', { class: 'team-req' }, 'Requested: ', h('b', null, A.teamName(A.teamRequest(u.id)))) : null,
-              h('div', { class: 'row', style: { gap: '4px', marginTop: '4px' } },
+              canTeam ? h('div', { class: 'row', style: { gap: '4px', marginTop: '4px' } },
                 A.teamRequest(u.id) ? h('button', { class: 'btn btn-sm btn-primary', onclick: () => setTeam(u, A.teamRequest(u.id)) }, icon('check'), 'Accept') : null,
-                h('button', { class: 'btn btn-sm', onclick: () => changeTeam(u) }, 'Change'))]),
+                h('button', { class: 'btn btn-sm', onclick: () => changeTeam(u) }, 'Change')) : null]),
             h('td', null, removed ? h('span', { class: 'pill grey' }, 'Removed') : h('span', { class: 'row', style: { gap: '6px' } }, UI.dot(p.state), UI.stateLabel(p.state))),
             h('td', null, new Date(u.created).toLocaleDateString()),
             h('td', { class: 'act' }, canManage ? [
-              owner ? h('button', { class: 'btn btn-sm', onclick: () => toggleAdmin(u) }, icon('shield'), isAdm ? 'Remove admin' : 'Make admin') : null, ' ',
-              h('button', { class: 'btn btn-sm', onclick: () => resetPw(u) }, icon('key'), 'Reset password'), ' ',
-              h('button', { class: 'btn btn-sm btn-danger', onclick: () => removeUser(u) }, icon('userX'), 'Remove')] : null));
-        }))));
+              A.can('ppl.reset') ? h('button', { class: 'btn btn-sm', onclick: () => resetPw(u) }, icon('key'), 'Reset password') : null, ' ',
+              A.can('ppl.remove') ? h('button', { class: 'btn btn-sm btn-danger', onclick: () => removeUser(u) }, icon('userX'), 'Remove') : null] : null));
+        }))), owner ? RU.saveBar(draw) : null);
     }
     async function setTeam(u, team) {
       try { await A.assignTeam(u.id, team); UI.toast(`${u.name} is now in ${A.teamName(A.teamOf(u.id))}`, 'ok'); draw(); schedule('banners'); } catch (e) { UI.toast(e.message, 'error'); }
@@ -2358,18 +2450,6 @@
         h('div', { class: 'field' }, h('span', { class: 'label' }, 'Group'), tf.el),
         h('p', { class: 'muted', style: { fontSize: '13px' } }, 'Group-only announcements go to the people accepted in that group.')],
       foot: [h('button', { class: 'btn', onclick: () => cm.close() }, 'Cancel'), ok] });
-    }
-    async function toggleAdmin(u) {
-      const isAdm = A.isUserAdmin(u.id);
-      const ok = await UI.confirm(isAdm
-        ? { title: `Remove ${u.name} as admin?`, text: `${u.name} goes back to being regular staff. Things they did while admin (channels, renames, removals) stay as they are.`, ok: 'Remove admin', danger: true }
-        : { title: `Make ${u.name} an admin?`, text: `${u.name} will be able to create, rename and archive channels, hide messages, and reset passwords or remove regular staff. They can’t read direct messages or feedback, and can’t manage other admins.`, ok: 'Make admin' });
-      if (!ok) return;
-      try {
-        if (isAdm) await A.revokeAdmin(u.id); else await A.appointAdmin(u.id);
-        UI.toast(isAdm ? `${u.name} is no longer an admin` : `${u.name} is now an admin`, 'ok');
-        draw(); schedule('side', 'msgs');
-      } catch (e) { UI.toast(e.message, 'error'); }
     }
     function activity() {
       const describe = a => {
@@ -2392,7 +2472,7 @@
       return h('table', { class: 'table' }, h('thead', null, h('tr', null, h('th', null, 'When'), h('th', null, 'Who'), h('th', null, 'What'))),
         h('tbody', null, list.map(a => h('tr', null,
           h('td', { class: 'muted' }, U.formatDateTime(a.ts)),
-          h('td', null, A.name(a.userId)),
+          h('td', null, A.name(a.userId), (r => (r ? h('span', { class: 'muted' }, ` (${r})`) : null))(a.kid ? A.roleNameAt(a.userId, a.kid, a.ts) : A.roleLabel(a.userId))),
           h('td', null, a.text, a.valid ? null : [' ', h('span', { class: 'pill grey', title: 'Not allowed for this person, so every app ignores it' }, 'Ignored')])))));
     }
     async function resetPw(u) {
@@ -2511,7 +2591,14 @@
         h('p', { class: 'muted', style: { fontSize: '14px' } }, 'Anyone who can change the app’s own files could change the code to capture passwords. Keep the app folder read-only for staff. To check it, pick the SankyoChat folder (the one with index.html) and compare its fingerprint.'),
         btn, out);
     }
-    const m = UI.modal({ title: 'Admin settings', cls: 'wide', body: [tabs, panel] });
+    // unsaved role changes: offer to save them when the dialog closes
+    const m = UI.modal({ title: 'Admin settings', cls: 'wide', body: [tabs, panel], onClose: async () => {
+      if (!owner || !SC.rolesUI.dirty()) { SC.rolesUI.reset(); return; }
+      const n = SC.rolesUI.changes().length;
+      const save = await UI.confirm({ title: `Save ${n} role change${n === 1 ? '' : 's'}?`, ok: 'Review and save', text: 'You changed roles but didn’t save. If you don’t, the changes are discarded and nobody sees them.' });
+      if (save) await SC.rolesUI.review(() => {});
+      SC.rolesUI.reset();
+    } });
     draw();
   }
 
@@ -2590,9 +2677,9 @@
     const kids = [];
     if (!members.length) kids.push(h('div', { class: 'ann-empty' }, s ? 'No one matches.' : 'Nobody has been accepted into this group yet.'));
     kids.push(...members.map(u => row(u)));
-    const waiting = A.isAdmin() ? A.teamPending().filter(u => A.teamRequest(u.id) === tid) : [];
+    const waiting = A.teamPendingForMe().filter(u => A.teamRequest(u.id) === tid);
     if (waiting.length) {
-      kids.push(h('div', { class: 'team-wait-head' }, h('span', { class: 'wait-dot' }), `Waiting for acceptance (${waiting.length}) · only admins see this`));
+      kids.push(h('div', { class: 'team-wait-head' }, h('span', { class: 'wait-dot' }), `Waiting for acceptance (${waiting.length}) · only people who can accept see this`));
       kids.push(...waiting.map(u => row(u, h('span', { class: 'row', style: { gap: '6px' } },
         h('button', { class: 'btn btn-sm btn-primary', 'data-action': 'accept' }, 'Accept'),
         h('button', { class: 'btn btn-sm', 'data-action': 'change' }, 'Change')))));
@@ -2622,7 +2709,7 @@
     const wasUnread = new Set(N.list().filter(N.isUnread).map(it => it.id));
     const tabs = h('div', { class: 'tabs', role: 'tablist' });
     const list = h('div', { class: 'notif-list', role: 'list' });
-    const canRequests = () => A.isAdmin() || Array.from(Y.chans.values()).some(c => c.kind === 'group' && Y.canManageGroup(c)) || N.list('requests').length > 0;
+    const canRequests = () => A.can('grp.accept') || Array.from(Y.chans.values()).some(c => c.kind === 'group' && Y.canManageGroup(c)) || N.list('requests').length > 0;
     const tabBtn = (id, label, n) => h('button', { role: 'tab', 'aria-selected': String(tab === id), onclick: () => { tab = id; draw(); } }, label, n ? h('span', { class: 'tab-n' }, String(n)) : null);
     function row(it) {
       const d = N.describe(it);
@@ -2857,6 +2944,15 @@
 
   /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
   const NEWS = [
+    { version: '1.12.0', items: [
+      ['shield', 'Roles and permissions', 'Super admin: Admin settings → Roles shows what the super admin, admins and every custom role can do. Create roles like Moderator or Group leader and tick what they may do: announcements, channels, pins, hiding, polls, groups and project boards. Password resets, removing people and real names stay with admins.'],
+      ['users', 'Give people a role', 'Admin settings → People has a Role dropdown for each person: Staff, a custom role, or Admin. There’s always exactly one super admin; Admin and custom roles have no limit.'],
+      ['info', 'Role guide', 'If you have a role, ⚙ → Role guide shows what you can do. You’re told when your role changes.'],
+    ] },
+    { version: '1.11.0', items: [
+      ['shield', 'Hourly backups', 'Super admin: Admin settings → Backups. Choose a folder on the shared storage, outside the SankyoChat folder. Every hour the app saves what changed into one folder per day. To keep backing up while your app is closed, also run “1 Set up hourly backup” from the backup folder once on the file server.'],
+      ['refresh', 'Restore when data is lost', 'If the data folder is emptied or deleted, the app asks for a backup before anyone can start a new workspace, and copies it back into data. The backup itself stays untouched.'],
+    ] },
     { version: '1.10.0', items: [
       ['board', 'Project boards for each group', 'Sidebar → Project boards: PICKUP GROUP and INPUT GROUP each have their own board with four columns: Review, In progress, Checking and Done. Each card has the project number and name, priority, label (Input or Correction), members, progress, deadline and the superior who assigned it. Admins manage their group’s board; you see your own group’s.'],
       ['check', 'Approve PICKUP projects', 'PICKUP admins approve a project in Done. It turns grey and goes to the INPUT GROUP board in Review. When an INPUT admin clicks Receive, it leaves the PICKUP board and PICKUP is told who received it.'],

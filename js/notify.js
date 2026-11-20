@@ -419,8 +419,8 @@
     if (!A.me || !A.ws) return;
     drop(it => ['team', 'newUser', 'adm', 'aud', 'chan', 'ann'].includes(it.type));
     const lo = floor();
-    if (A.isAdmin()) {
-      for (const u of A.teamPending()) if (u.id !== me()) add({ id: `tm:${u.id}`, type: 'team', ts: u.updated || u.created || Date.now(), actor: u.id });
+    if (A.can('grp.accept')) {
+      for (const u of A.teamPending()) if (u.id !== me() && A.canAcceptTeam(u.id)) add({ id: `tm:${u.id}`, type: 'team', ts: u.updated || u.created || Date.now(), actor: u.id });
       for (const u of A.activeUsers()) if (u.id !== me() && u.created > lo) add({ id: `nu:${u.id}`, type: 'newUser', ts: u.created, actor: u.id });
     }
     if (!A.isOwner()) return;

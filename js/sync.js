@@ -247,7 +247,7 @@
 
   /** Who may pin: admins in channels; the group's creator and group admins in groups. */
   function pinAllowed(ch, uid, kid, ts) {
-    if (ch.kind === 'public') return A.canActAt(uid, kid, ts);
+    if (ch.kind === 'public') return A.canAt(uid, kid, ts, 'msg.pin');
     if (ch.kind === 'group') return Y.isGroupAdmin(ch, uid);
     return false;
   }
@@ -258,7 +258,7 @@
     } else if (ev.type === 'delete') {
       if (ev.userId === msg.userId) msg.deleted = true;
     } else if (ev.type === 'hide') {
-      if (ch.kind === 'public' && A.canActAt(ev.userId, ev.kid, ev.ts)) msg.hidden = true;
+      if (ch.kind === 'public' && A.canAt(ev.userId, ev.kid, ev.ts, 'msg.hide')) msg.hidden = true;
     } else if (ev.type === 'react') {
       // One reaction per person per message: it's whatever their newest reaction event says ("on" = that
       // emoji, "off" = none), so picking another emoji replaces the old one. Newest by time (then id),
@@ -287,7 +287,7 @@
     if (m.type === 'message') {
       if (ch.msgs.has(m.id)) return false;
       // only polls created by an admin (at the time) count; anything else shows as a plain message
-      if (m.poll && !(m.verified && A.canActAt(m.userId, m.kid, m.ts))) m.poll = null;
+      if (m.poll && !(m.verified && A.canAt(m.userId, m.kid, m.ts, 'msg.poll'))) m.poll = null;
       Object.assign(m, { edited: false, editTs: 0, deleted: false, hidden: false, reactions: new Map(), votes: new Map() });
       ch.msgs.set(m.id, m);
       if (m.ts > ch.lastActivity) ch.lastActivity = m.ts;
@@ -631,10 +631,10 @@
   };
 
   /* ---- pins ---- */
-  Y.canPin = ch => !!ch && (ch.kind === 'public' ? A.isAdmin() : ch.kind === 'group' ? Y.isGroupAdmin(ch) : false);
+  Y.canPin = ch => !!ch && (ch.kind === 'public' ? A.can('msg.pin') : ch.kind === 'group' ? Y.isGroupAdmin(ch) : false);
   Y.isPinned = (ch, id) => { const p = ch.pins.get(id); return !!(p && p.on); };
   Y.pin = (ch, msg, on) => {
-    if (!Y.canPin(ch)) return Promise.reject(err(ch.kind === 'group' ? 'Only the group’s creator and group admins can pin messages.' : 'Only admins can pin messages.'));
+    if (!Y.canPin(ch)) return Promise.reject(err(ch.kind === 'group' ? 'Only the group’s creator and group admins can pin messages.' : 'You aren’t allowed to pin messages.'));
     return event(ch, 'pin', { targetId: msg.id, on: !!on });
   };
   /** Pinned messages, newest pin first. `msg` is null while the message isn't loaded yet. */
@@ -673,7 +673,7 @@
     return { byOption: out, voters };
   };
   Y.sendPoll = async function (ch, { question, options }) {
-    if (!A.isAdmin()) throw err('Only admins can create polls.');
+    if (!A.can('msg.poll')) throw err('You aren’t allowed to create polls.');
     question = String(question || '').replace(/\s+$/, '').trim();
     if (!question) throw err('Write the question first.');
     if (question.length > 300) throw err('Questions can be at most 300 characters.');
@@ -706,7 +706,7 @@
   Y.normalizeChannelName = n => String(n || '').trim().toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9\-_]/g, '').replace(/-+/g, '-').slice(0, 40);
 
   Y.createChannel = async function ({ name, description }) {
-    if (!A.isAdmin()) throw err('Only admins can create channels.');
+    if (!A.can('ch.create')) throw err('You aren’t allowed to create channels.');
     name = Y.normalizeChannelName(name);
     if (name.length < 2) throw err('Channel names need at least 2 letters or numbers.');
     const taken = Array.from(chans.values()).some(c => c.kind === 'public' && Y.info(c).name === name);
@@ -750,7 +750,7 @@
 
   /** Admins: an encrypted, invite-only channel. `replaces` = id of a public channel being made private (its name may be reused). */
   Y.createPrivateChannel = async function ({ name, description, userIds, replaces, listed }) {
-    if (!A.isAdmin()) throw err('Only admins can create private channels.');
+    if (!(replaces ? A.can('ch.makePrivate') : A.can('ch.createPrivate'))) throw err(replaces ? 'You aren’t allowed to make channels private.' : 'You aren’t allowed to create private channels.');
     name = Y.normalizeChannelName(name);
     if (name.length < 2) throw err('Channel names need at least 2 letters or numbers.');
     const taken = Array.from(chans.values()).some(c => c.id !== replaces && (c.kind === 'public' ? !Y.info(c).archived : Y.isPrivateChannel(c)) && Y.info(c).name === name);
@@ -793,7 +793,7 @@
     noteMyPost(id, meta.ts);
     if (meta.listed) await syncDirectory(ch).catch(e => console.warn('directory', e));
     // admins' named groups and private channels are reported to the super admin (the name is sealed for them only)
-    if (name && A.isAdmin() && !A.isOwner()) {
+    if (name && (A.isAdmin() || A.hasCustomRole()) && !A.isOwner()) {
       const kind = opts.replaces ? 'private-channel.make-private' : opts.channel ? 'private-channel.create' : 'group.create';
       await A.audit(kind, id, members.length, { name }).catch(e => console.warn('audit', e));
     }
@@ -1062,7 +1062,7 @@
       if (!meta || !(await verifyMeta(meta, id))) { failed.add(id); return null; }
       if (meta.type !== (kind === 'group' ? 'group' : 'public')) { notMine.add(id); return null; }
       // Only channels created (and signed) by an admin count; anything else on the share is ignored.
-      if (kind === 'public' && !A.canActAt(meta.createdBy, meta.kid, meta.ts)) { notMine.add(id); return null; }
+      if (kind === 'public' && !A.canAt(meta.createdBy, meta.kid, meta.ts, 'ch.create')) { notMine.add(id); return null; }
       // Not a member (yet): the creator may add us later, so re-check when the group shows newer activity.
       if (kind === 'group' && !(Array.isArray(meta.members) && meta.members.includes(me()) && meta.keys && meta.keys[me()])) { if (!groupMiss.has(id)) groupMiss.set(id, 0); return null; }
       if (kind === 'group') {
@@ -1404,7 +1404,7 @@
         typeof raw.text === 'string' && await verifyRaw(raw);
       if (!ok) { badAnn.add(id); continue; }
       // not (yet) known as an admin here, e.g. this PC hasn't seen the new workspace.json: re-check later
-      if (!A.canActAt(raw.userId, raw.kid, raw.ts)) continue;
+      if (!A.canAt(raw.userId, raw.kid, raw.ts, Array.isArray(raw.to) ? 'ann.private' : 'ann.post')) continue;
       let title = raw.title, text = raw.text, to = null;
       if (Array.isArray(raw.to)) {
         if (!raw.to.includes(me())) { badAnn.add(id); continue; } // private, and not for me
@@ -1439,7 +1439,7 @@
       editMtimes.set(id, r.lastModified);
       const raw = r.data;
       if (raw.type !== 'ann-edit' || raw.target !== id || raw.userId !== a.userId || typeof raw.ts !== 'number' || raw.ts <= (a.editTs || 0)) continue;
-      if (!(await verifyRaw(raw)) || !A.canActAt(raw.userId, raw.kid, raw.ts)) continue;
+      if (!(await verifyRaw(raw)) || !A.canAt(raw.userId, raw.kid, raw.ts, a.to ? 'ann.private' : 'ann.post')) continue;
       let title = raw.title, text = raw.text;
       if (a.to) {
         const k = annKeys.get(id);
@@ -1453,7 +1453,7 @@
     return changed;
   }
 
-  Y.canEditAnnouncement = a => !!a && !!A.me && a.userId === me() && A.isAdmin();
+  Y.canEditAnnouncement = a => !!a && !!A.me && a.userId === me() && A.can(a.to ? 'ann.private' : 'ann.post');
   Y.editAnnouncement = async function (id, { title, text }) {
     const a = Y.announcements.get(id);
     if (!Y.canEditAnnouncement(a)) throw err('Only the admin who posted it can edit it.');
@@ -1536,7 +1536,7 @@
   Y.canAnnounceTo = id => { const t = Y.announceTeam(); return t === null || (!!t && A.teamOf(id) === t); };
 
   Y.postAnnouncement = async function ({ title, text, to, label }) {
-    if (!A.isAdmin()) throw err('Only admins can post announcements.');
+    if (!A.can(Array.isArray(to) ? 'ann.private' : 'ann.post')) throw err(Array.isArray(to) ? 'You aren’t allowed to send private announcements.' : 'You aren’t allowed to post announcements to everyone.');
     if (Array.isArray(to)) {
       const t = Y.announceTeam();
       if (t === '') throw err('You need an accepted group before you can send private announcements.');
@@ -1586,7 +1586,7 @@
   Y.withdrawAnnouncement = async function (id) {
     const a = Y.announcements.get(id);
     if (!a) return;
-    if (!A.isAdmin()) throw err('Only admins can withdraw announcements.');
+    if (!A.can('ann.withdraw') && !Y.canEditAnnouncement(a)) throw err('You aren’t allowed to withdraw announcements.');
     await S.remove(`announcements/${id}.json`);
     await S.remove(`announcements/edits/${id}.json`).catch(() => {});
     Y.announcements.delete(id);

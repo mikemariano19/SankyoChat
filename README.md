@@ -10,9 +10,9 @@ A team chat app made of plain HTML, CSS and JavaScript. It runs with no internet
 2. Permissions:
    - App files (`index.html`, `check.html`, `css`, `js`, `assets`): **read-only** for staff. Only you or IT can change them. Anyone who can edit the code could make it capture passwords.
    - `data` folder: **Modify** for the staff group only.
-3. Turn on Previous Versions (shadow copies) for the share, or copy `data` daily. A copy of `data` is a full backup, and DMs stay encrypted in it.
+3. Turn on **backups**: after step 5, open ⚙ → Admin settings → **Backups** and choose a folder on the shared storage outside the SankyoChat folder (see [Backups](#backups)). Previous Versions (shadow copies) on the share add another layer. A copy of `data` is a full backup, and DMs stay encrypted in it.
 4. Give staff a desktop shortcut to `\\fileserver\Shared\SankyoChat\index.html`, set to open in Edge or Chrome.
-5. **Open the app yourself first.** The first person to connect an empty `data` folder creates the workspace and becomes the **super admin**. You'll also set a **security question**: if you forget your password, pick your name on the sign-in screen and click **Forgot password?** to choose a new one (your messages stay readable). Change the question any time in ⚙ → **Security question**. Treat the answer like a second password, because anyone with the data folder can try guesses. Without the question, nobody can reset the super admin's password. Appoint admins later in ⚙ → Admin settings → People → **Make admin**.
+5. **Open the app yourself first.** The first person to connect an empty `data` folder creates the workspace and becomes the **super admin**. You'll also set a **security question**: if you forget your password, pick your name on the sign-in screen and click **Forgot password?** to choose a new one (your messages stay readable). Change the question any time in ⚙ → **Security question**. Treat the answer like a second password, because anyone with the data folder can try guesses. Without the question, nobody can reset the super admin's password. Give people roles later in ⚙ → Admin settings → People → **Role** (Admin, or a custom role from the **Roles** tab).
 6. Optional: in the app, open ⚙ → Admin settings → App files → **Check app files**, pick the `SankyoChat` folder, and click **Save as trusted fingerprint**. Later you can re-check whether anyone changed the code.
 
 When a PC has problems, open `check.html`. It tests the browser, folder access (it writes, reads and deletes a small file), encryption and notifications.
@@ -25,10 +25,52 @@ When a PC has problems, open `check.html`. It tests the browser, folder access (
 
 Apps older than 1.9 don't know update mode. For the first rollout of 1.9, copy the files, then ask everyone to reload (they also see "A new version is available. Reload" within 5 minutes).
 
+### Backups
+
+Backups go into a folder you choose on the shared storage, **outside** the SankyoChat folder (e.g. `SankyoChat-Backups` next to it), so deleting the app or the data folder can't delete them.
+
+**How a backup works:** every hour, `data` is compared with today's backup. If nothing changed, nothing is written. If something changed, only the new and changed files are copied into today's folder, `data-YYYY-MM-DD`. A new day gets a new folder.
+
+- Files are added or overwritten in a day's folder, **never deleted from it**. If part of `data` is deleted by accident (say `users`), that day's backup still has it. Earlier days are untouched.
+- If `data` suddenly holds a *different* workspace (someone started a new one over a deleted folder), today's folder is left alone and the copy goes to `data-YYYY-MM-DD_2`.
+- `presence` (who's online) isn't backed up. `workspace.json` goes last in a new folder, so a copy that stopped half-way is never offered for restore.
+- If `data` is missing or empty, nothing is copied and **no backups are deleted**. Day folders older than 30 days are removed (`KEEP_DAYS` in `js/backup.js`, `KeepDays` in the script settings).
+- Each day folder has a `.sankyo-backup.json` record: when it was last updated, the workspace, and the size and date of every file, which is how changes are found.
+
+**Two things can do the hourly check. Use both, pointed at the same backup folder:**
+
+1. **The app (super admin):** ⚙ → Admin settings → **Backups** → **Choose backup folder**. It checks every hour, but only while the super admin is signed in, because a browser page can't run when it's closed. Until a folder is chosen, the super admin sees a "Backups aren't set up" banner. If the browser asks for permission again, a "Backups are paused" banner has an **Allow** button.
+2. **The Windows task, for when the app is closed:** on the file server or a PC that's always on, double-click `backup\1 Set up hourly backup.bat` once. Give it the same backup folder and answer **Y** to "run when nobody is signed in". Windows asks for that account's password once and keeps it in Task Scheduler. Setup also puts its own copy of the tools, plus `RESTORE data from backup.bat`, in the backup folder, so the task keeps working if the app folder is deleted. Other files: `2 Back up now.bat`, `Backup status.bat`, `Turn off hourly backup.bat`.
+
+**Restore:** if the data folder is empty (or its `workspace.json` is gone), the app doesn't go straight to "Create workspace". It shows **The data is gone** with **Restore from "SankyoChat-Backups"** (on the super admin's PC) or **Restore from a backup** (pick the backup folder). Pick a day (the newest is preselected), and the app **copies** it into the data folder, then opens the workspace as usual. The app works on that new copy, and the backup stays untouched. Everyone else is told to wait for the super admin. A new workspace can still be started, behind a warning.
+
+- If the data folder itself was deleted, the app asks you to make a new empty `data` folder in the folder window and select it, then offers the restore. With the app closed everywhere, `RESTORE data from backup.bat` does the same.
+- If someone connects a backup copy as if it were the data folder, the app refuses and explains how to restore instead.
+- People sign in with the password they had at the time of the backup. Anything sent after it is gone.
+
+### Roles and permissions (1.12)
+
+**Super admin:** ⚙ → Admin settings → **Roles**. Cards at the top show each role, how many people have it and how many permissions it has. Below them, a table lists every permission (down the side) for every role (across the top).
+
+- **Built-in roles:** **Super admin** (always exactly one, the workspace creator) and **Admin** (no limit). Neither can be edited.
+- **Custom roles:** **＋ New role** creates one, such as Moderator or Group leader. Give it a name, a colour, a description and the permissions it gets. There's no limit on the number of roles or on how many people hold one. Each role's **⋯** menu has Edit, Duplicate, Select all, Clear all and Delete.
+- **Three permission tiers:**
+  - **Can be given to a role:** announcements (everyone, private, withdraw), channels (create public or private, manage, make private), hide, pin, polls, accepting and moving people between groups, managing the project board, the activity log.
+  - **Admins only (security):** reset passwords, remove people, see real names. These show a lock for custom roles.
+  - **Super admin only:** roles and admins, workspace settings, group names, update mode, backups, app files, the feedback inbox.
+- **Group scope:** accepting people into groups and managing the project board can be limited to **Own group** (the default) or **All groups**.
+- **Giving people a role:** use the **Role** dropdown in Admin settings → People: Staff, a custom role, or Admin.
+- **Saving:** changes collect in a draft ("N unsaved changes"). **Review and save** shows who is affected, then signs `workspace.json` once. Everyone's app picks it up within seconds.
+- **Holders:** people with a role get ⚙ → **Role guide**, which shows only what they can do, and a notice when their role changes. Activity shows the role each action was taken under.
+
+How it's enforced: roles live in `workspace.json` as `roles`, `roleHolders` and `formerRoleHolders`, signed by the super admin. Each holder keeps a snapshot of the role's rights with a start time. Editing a role closes the old stint and opens a new one, so every PC judges each signed action by the rights its author had at that moment: taking a right away never undoes past actions. Every app ignores admin-tier and super-admin-tier permissions for custom roles, whatever the file says. Role holders are deliberately **not** in `ws.admins`, because apps older than 1.12 treat everyone there as a full admin. Older apps simply ignore role holders' actions, so roll out 1.12 with Update mode before you hand out roles.
+
 ## How it works
 
 | File | Role |
 | --- | --- |
+| `js/backup.js` | Hourly change check of `data` into daily backup folders (super admin), and restore into an empty data folder |
+| `js/roles-ui.js` | Admin settings → Roles: role cards, the permissions table, the New role dialog, and the People tab role dropdowns (super admin) |
 | `js/store.js` | The only module that touches the shared folder (File System Access API) |
 | `js/crypto.js` | Web Crypto: ECDSA P-256 signatures, ECDH P-256 + HKDF, AES-GCM 256, PBKDF2-SHA256 at 600,000 rounds |
 | `js/account.js` | Workspace, profiles, sign-in, admin actions, feedback inbox |

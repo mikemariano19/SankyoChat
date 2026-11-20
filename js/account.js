@@ -110,8 +110,210 @@
   A.adminEntry = id => (A.ws && A.ws.admins && A.ws.admins[id]) || null;
   A.isAdmin = () => A.isOwner() || !!(A.me && A.adminEntry(A.me.id) && A.adminEntry(A.me.id).kid === A.me.signFp);
   A.isUserAdmin = id => !!A.ws && (id === A.ws.adminId || !!A.adminEntry(id));
-  /** 'Super admin' | 'Admin' | '' */
-  A.roleLabel = id => (!A.ws ? '' : id === A.ws.adminId ? 'Super admin' : A.adminEntry(id) ? 'Admin' : '');
+  /** 'Super admin' | 'Admin' | a custom role's name | '' */
+  A.roleLabel = id => {
+    if (!A.ws) return '';
+    if (id === A.ws.adminId) return 'Super admin';
+    if (A.adminEntry(id)) return 'Admin';
+    const r = A.customRoleOf(id);
+    return r ? r.name : '';
+  };
+
+  /* ---- custom roles (1.12) ----
+   * The super admin defines roles in workspace.json (ws.roles[roleId] = {name, color, desc, perms, scope}) and gives
+   * them to people in ws.roleHolders[userId] = {role, kid, since, perms, scope}: a SNAPSHOT of the role's rights at
+   * that moment. Editing a role closes every holder's stint (into ws.formerRoleHolders) and opens a new one, so an
+   * action is judged by the rights its author had when they took it, like admin stints.
+   * Role holders are deliberately NOT in ws.admins: apps older than 1.12 treat everyone there as a full admin.
+   * Only "role"-tier permissions ever count for a role holder, whatever the file says. */
+  A.PERMS = [
+    ['ann.post', 'role'], ['ann.private', 'role'], ['ann.withdraw', 'role'],
+    ['ch.create', 'role'], ['ch.createPrivate', 'role'], ['ch.manage', 'role'], ['ch.makePrivate', 'role'],
+    ['msg.hide', 'role'], ['msg.pin', 'role'], ['msg.poll', 'role'],
+    ['grp.accept', 'role'], ['board.manage', 'role'], ['grp.rename', 'super'],
+    ['log.view', 'role'], ['ppl.realname', 'admin'], ['ppl.reset', 'admin'], ['ppl.remove', 'admin'],
+    ['sec.roles', 'super'], ['ws.settings', 'super'], ['ws.update', 'super'], ['ws.backup', 'super'], ['ws.files', 'super'], ['ws.feedback', 'super'],
+  ].map(([id, tier]) => ({ id, tier }));
+  A.PERM_TIER = Object.fromEntries(A.PERMS.map(p => [p.id, p.tier]));
+  A.ROLE_PERMS = A.PERMS.filter(p => p.tier === 'role').map(p => p.id);
+  /** Permissions that can be limited to the holder's own group. */
+  A.SCOPED_PERMS = ['grp.accept', 'board.manage'];
+  A.ROLE_COLORS = ['#0EA5E9', '#16A34A', '#F59E0B', '#EC4899', '#8B5CF6', '#14B8A6', '#F97316', '#64748B'];
+  const RESERVED_ROLE_NAMES = ['admin', 'super admin', 'staff'];
+
+  A.roles = () => (A.ws && A.ws.roles) || {};
+  /** Current role stint of a person (whatever key it was made for). */
+  A.roleStint = id => (A.ws && A.ws.roleHolders && A.ws.roleHolders[id]) || null;
+  /** The custom role a person holds now: {id, name, color, ...} or null. */
+  A.customRoleOf = id => {
+    const st = A.roleStint(id);
+    const r = st && A.roles()[st.role];
+    return r ? Object.assign({ id: st.role }, r) : null;
+  };
+  /** 'super' | 'admin' | roleId | 'staff' */
+  A.roleIdOf = id => (!A.ws ? 'staff' : id === A.ws.adminId ? 'super' : A.adminEntry(id) ? 'admin' : (A.customRoleOf(id) || {}).id || 'staff');
+  A.roleColorOf = id => {
+    const r = A.roleIdOf(id);
+    return r === 'super' ? '#7C3AED' : r === 'admin' ? '#DC2626' : r === 'staff' ? '' : (A.roles()[r] || {}).color || '';
+  };
+  /** My role stint, if it was made for my current key. */
+  function myStint() {
+    const st = A.me && A.roleStint(A.me.id);
+    return st && st.kid === A.me.signFp && A.roles()[st.role] ? st : null;
+  }
+  /** I hold a custom role (not admin). */
+  A.hasCustomRole = () => !A.isAdmin() && !!myStint();
+
+  /** Scope check for a stint: 'own' limits group permissions to the holder's group.
+   *  ctx.team = the group the action is about; ctx.from = the group someone is moved out of. */
+  function scopeOk(st, perm, uid, ctx) {
+    if (!A.SCOPED_PERMS.includes(perm) || (st.scope || {})[perm] === 'all') return true;
+    // while the admin log is replayed, the actor's group comes from the state being rebuilt (ctx.actorTeam)
+    const mine = ctx && ctx.actorTeam !== undefined ? ctx.actorTeam : A.teamOf(uid);
+    if (!mine) return false;
+    if (!ctx || !ctx.team) return true;
+    return ctx.team === mine || (perm === 'grp.accept' && ctx.from === mine);
+  }
+  /** Is this permission limited to my own group? */
+  A.ownGroupOnly = perm => {
+    if (A.isOwner()) return false;
+    if (A.isAdmin()) return perm === 'board.manage';
+    const st = myStint();
+    return !!st && A.SCOPED_PERMS.includes(perm) && (st.scope || {})[perm] !== 'all';
+  };
+
+  /**
+   * Can I do this now? Super admin: everything. Admin: everything but super-admin-only (board: own group).
+   * Custom role: role-tier permissions in my stint, within its scope.
+   * @param {string} perm  @param {{team?:string, from?:string}} [ctx]
+   */
+  A.can = function (perm, ctx) {
+    if (!A.me || !A.ws) return false;
+    if (A.isOwner()) return true;
+    const tier = A.PERM_TIER[perm];
+    if (!tier) return false;
+    if (A.isAdmin()) {
+      if (tier === 'super') return false;
+      if (perm === 'board.manage' && ctx && ctx.team) return A.teamOf(A.me.id) === ctx.team;
+      return true;
+    }
+    const st = myStint();
+    return !!st && tier === 'role' && (st.perms || []).includes(perm) && scopeOk(st, perm, A.me.id, ctx);
+  };
+  /** Any of these permissions. */
+  A.canAny = (...perms) => perms.some(p => A.can(p));
+  /** Can this person (by their current key) do it now? Used to list e.g. who may manage a board. */
+  A.userCan = function (id, perm, ctx) {
+    if (!A.ws) return false;
+    if (id === A.ws.adminId) return true;
+    const tier = A.PERM_TIER[perm];
+    if (A.adminEntry(id)) return tier !== 'super' && (perm !== 'board.manage' || !ctx || !ctx.team || A.teamOf(id) === ctx.team);
+    const st = A.roleStint(id);
+    const u = A.users.get(id);
+    return !!st && !!u && st.kid === u.kid && tier === 'role' && !!A.roles()[st.role] && (st.perms || []).includes(perm) && scopeOk(st, perm, id, ctx);
+  };
+  /** Was (userId, key) allowed to do `perm` at time ts? Admin stints count for everything but super-admin-only,
+   *  role stints for the role-tier permissions in their snapshot. Every app runs this on every signed action. */
+  A.canAt = function (userId, kid, ts, perm, ctx) {
+    if (!A.ws || !kid) return false;
+    const tier = A.PERM_TIER[perm];
+    if (!tier) return false;
+    if (userId === A.ws.adminId) return kid === A.ws.kid;
+    if (tier !== 'super' && A.canActAt(userId, kid, ts)) return true;
+    if (tier !== 'role') return false;
+    return roleStintsAt(userId, kid, ts).some(s => (s.perms || []).includes(perm) && scopeOk(s, perm, userId, ctx));
+  };
+  /** The role someone acted under at time ts, for the activity log. */
+  A.roleNameAt = function (userId, kid, ts) {
+    if (!A.ws) return '';
+    if (userId === A.ws.adminId) return 'Super admin';
+    if (A.canActAt(userId, kid, ts)) return 'Admin';
+    const s = roleStintsAt(userId, kid, ts)[0];
+    return s ? ((A.roles()[s.role] || {}).name || 'a deleted role') : '';
+  };
+  /** Did this person hold admin rights or any custom role at time ts? (for audit records) */
+  A.privilegedAt = (userId, kid, ts) => A.canActAt(userId, kid, ts) || roleStintsAt(userId, kid, ts).length > 0;
+  function roleStintsAt(userId, kid, ts) {
+    if (!A.ws) return [];
+    const skew = 5 * 60000;
+    const out = [];
+    const cur = A.roleStint(userId);
+    if (cur && cur.kid === kid && ts >= cur.since - skew) out.push(cur);
+    const past = (A.ws.formerRoleHolders && A.ws.formerRoleHolders[userId]) || [];
+    for (const p of past) if (p && p.kid === kid && ts >= p.since - skew && ts <= p.until) out.push(p);
+    return out;
+  }
+
+  function cleanRole(r) {
+    const name = String((r && r.name) || '').replace(/\s+/g, ' ').trim();
+    if (name.length < 2 || name.length > 24) throw err('Role names need 2 to 24 characters.');
+    if (RESERVED_ROLE_NAMES.includes(name.toLowerCase())) throw err(`“${name}” is a built-in name. Pick another one.`);
+    const perms = U.uniq((r.perms || []).filter(p => A.ROLE_PERMS.includes(p)));
+    if (!perms.length) throw err(`Tick at least one permission for ${name}.`);
+    const scope = {};
+    for (const p of A.SCOPED_PERMS) if (perms.includes(p)) scope[p] = r.scope && r.scope[p] === 'all' ? 'all' : 'own';
+    const color = A.ROLE_COLORS.includes(r.color) ? r.color : A.ROLE_COLORS[0];
+    return { name, color, desc: String(r.desc || '').trim().slice(0, 120), perms, scope };
+  }
+  const sameRights = (a, b) => !!a && !!b && a.role === b.role && JSON.stringify([...(a.perms || [])].sort()) === JSON.stringify([...(b.perms || [])].sort()) &&
+    JSON.stringify(a.scope || {}) === JSON.stringify(b.scope || {});
+
+  /**
+   * Super admin: save role definitions and who has which role, in one signed workspace.json write.
+   * @param {Object<string, {name, color, desc, perms, scope}>} roles  every custom role (missing ones are deleted)
+   * @param {Object<string, string>} assign  userId → 'staff' | 'admin' | roleId (people not listed keep their role)
+   */
+  A.saveRoles = async function (roles, assign) {
+    if (!A.isOwner()) throw err('Only the super admin can change roles.');
+    const now = Date.now();
+    const prevRoles = A.roles();
+    const nextRoles = {};
+    const names = new Set();
+    for (const [rid, r] of Object.entries(roles || {})) {
+      if (!/^r[a-z0-9]{3,8}$/.test(rid)) throw err('Bad role id.');
+      const c = cleanRole(r);
+      if (names.has(c.name.toLowerCase())) throw err(`There are two roles called “${c.name}”.`);
+      names.add(c.name.toLowerCase());
+      nextRoles[rid] = Object.assign(c, { created: (prevRoles[rid] && prevRoles[rid].created) || now, updated: now });
+    }
+    const admins = Object.assign({}, A.ws.admins);
+    const formerAdmins = Object.assign({}, A.ws.formerAdmins);
+    const holders = Object.assign({}, A.ws.roleHolders);
+    const formerHolders = Object.assign({}, A.ws.formerRoleHolders);
+    const closeAdmin = id => {
+      const cur = admins[id];
+      if (!cur) return;
+      formerAdmins[id] = (formerAdmins[id] || []).concat([{ kid: cur.kid, since: cur.since, until: now }]).slice(-10);
+      delete admins[id];
+    };
+    const closeRole = id => {
+      const cur = holders[id];
+      if (!cur) return;
+      formerHolders[id] = (formerHolders[id] || []).concat([{ role: cur.role, kid: cur.kid, since: cur.since, until: now, perms: cur.perms, scope: cur.scope }]).slice(-10);
+      delete holders[id];
+    };
+    const ids = U.uniq(Object.keys(assign || {}).concat(Object.keys(holders)));
+    for (const id of ids) {
+      if (id === A.ws.adminId) continue;
+      const u = A.users.get(id) || await A.loadUser(id);
+      const want = (assign && assign[id]) || (holders[id] ? holders[id].role : admins[id] ? 'admin' : 'staff');
+      if (!u || A.isRemoved(id)) { closeRole(id); if (assign && assign[id]) closeAdmin(id); continue; }
+      if (want === 'admin') {
+        closeRole(id);
+        if (!admins[id]) admins[id] = { kid: u.kid, since: now };
+      } else if (want !== 'staff' && nextRoles[want]) {
+        closeAdmin(id);
+        const r = nextRoles[want];
+        const next = { role: want, kid: u.kid, since: now, perms: r.perms, scope: r.scope };
+        if (!sameRights(holders[id], next) || holders[id].kid !== u.kid) { closeRole(id); holders[id] = next; }
+      } else {
+        closeRole(id);
+        closeAdmin(id);
+      }
+    }
+    await A.saveWorkspace({ roles: nextRoles, roleHolders: holders, formerRoleHolders: formerHolders, admins, formerAdmins });
+  };
+
   /** Was (userId, signing key) allowed to act as an admin at time ts? */
   A.canActAt = function (userId, kid, ts) {
     if (!A.ws || !kid) return false;
@@ -372,7 +574,7 @@
     general.sig = await C.sign(priv.sign, general);
     await S.writeJSON('channels/general/meta.json', general);
     const ws = { v: 1, id: 'w' + U.rand(10), name: wsName, created: now, updated: now, adminId: id, admin: keys.pub,
-      removed: [], resets: {}, admins: {}, formerAdmins: {}, autoLockMin: 30, channels: {}, appFingerprint: null, kid };
+      removed: [], resets: {}, admins: {}, formerAdmins: {}, roles: {}, roleHolders: {}, formerRoleHolders: {}, autoLockMin: 30, channels: {}, appFingerprint: null, kid };
     ws.sig = await C.sign(priv.sign, ws);
     await S.writeJSON('workspace.json', ws);
     U.ls.set('wsPin', { id: ws.id, kid });
@@ -560,6 +762,10 @@
   A.teamMembers = teamId => A.activeUsers().filter(u => A.teamOf(u.id) === teamId);
   /** People waiting for an admin to accept their group. */
   A.teamPending = () => A.activeUsers().filter(u => A.teamRequest(u.id));
+  /** Can I accept this person's group request (respects "own group only" roles)? */
+  A.canAcceptTeam = id => A.can('grp.accept', { team: A.teamRequest(id) || A.teamOf(id) || '', from: A.teamOf(id) || '' });
+  /** Requests I'm allowed to handle. */
+  A.teamPendingForMe = () => A.teamPending().filter(u => A.canAcceptTeam(u.id));
   /** I must choose a group before using the app (profiles made before groups existed). */
   A.needsTeam = () => !!A.me && !A.teamOf(A.me.id) && !A.teamRequest(A.me.id);
 
@@ -581,8 +787,10 @@
   };
   /** Admins: accept someone's requested group, or put them in the other one. */
   A.assignTeam = async function (id, team) {
-    if (!A.isAdmin()) throw err('Only admins can do that');
     team = A.validateTeam(team);
+    if (!A.can('grp.accept', { team, from: A.teamOf(id) || '' })) {
+      throw err(A.ownGroupOnly('grp.accept') ? `You can only accept or move people into or out of ${A.teamName(A.teamOf(A.me.id)) || 'your own group'}.` : 'You aren’t allowed to change people’s groups.');
+    }
     if (A.isRemoved(id)) throw err('That person was removed.');
     await adminAction('team', id, { team });
   };
@@ -611,12 +819,31 @@
     return A.findKey(u, kid, 'sign');
   }
 
+  /** Which permission an admin-log action needs, checked against the rights its author had at the time. */
+  function actionAllowed(a, eff) {
+    if (a.type === 'remove') return A.canAt(a.userId, a.kid, a.ts, 'ppl.remove');
+    if (a.type === 'reset') return A.canAt(a.userId, a.kid, a.ts, 'ppl.reset');
+    if (a.type === 'team') {
+      const to = A.normalizeTeam(a.team);
+      const from = eff.teams[a.target] || (A.users.get(a.target) || {}).team || '';
+      return A.canAt(a.userId, a.kid, a.ts, 'grp.accept', { team: to, from, actorTeam: eff.teams[a.userId] || '' });
+    }
+    if (a.type === 'channel') {
+      const p = a.patch || {};
+      const keys = Object.keys(p);
+      // archiving alone is also part of "Make private" (the public channel is archived)
+      if (keys.length === 1 && p.archived === true && A.canAt(a.userId, a.kid, a.ts, 'ch.makePrivate')) return true;
+      return A.canAt(a.userId, a.kid, a.ts, 'ch.manage');
+    }
+    return false;
+  }
+
   function recompute() {
     const ws = A.ws || {};
     const eff = { channels: JSON.parse(JSON.stringify(ws.channels || {})), removed: new Set(ws.removed || []), resets: Object.assign({}, ws.resets), teams: {} };
     const actions = Array.from(A.adminLog.values()).sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : 1));
     for (const a of actions) {
-      a.valid = A.canActAt(a.userId, a.kid, a.ts);
+      a.valid = actionAllowed(a, eff);
       if (!a.valid) continue;
       if (a.type === 'channel') {
         const p = a.patch || {};
@@ -663,7 +890,7 @@
   };
 
   async function adminAction(type, target, extra) {
-    if (!A.isAdmin()) throw err('Only admins can do that');
+    if (!A.isAdmin() && !A.hasCustomRole()) throw err('Only admins can do that');
     const ts = Date.now();
     const id = `${ts}_${A.me.id}_${U.rand(4)}`;
     const raw = Object.assign({ v: 1, id, type, target, ts, userId: A.me.id, kid: A.me.signFp }, extra || {});
@@ -702,6 +929,7 @@
     if (A.isOwner()) {
       const patch = { resets: Object.assign({}, A.ws.resets, { [id]: { ts: now, kid: signed.kid } }) };
       if (A.adminEntry(id)) Object.assign(patch, stintChange(id, { kid: signed.kid, since: now }));
+      if (A.roleStint(id)) Object.assign(patch, roleStintChange(id, Object.assign({}, A.roleStint(id), { kid: signed.kid, since: now })));
       await A.saveWorkspace(patch);
     } else {
       await adminAction('reset', id, { resetKid: signed.kid });
@@ -716,6 +944,7 @@
     if (A.isOwner()) {
       const patch = { removed: U.uniq((A.ws.removed || []).concat(id)) };
       if (A.adminEntry(id)) Object.assign(patch, stintChange(id, null));
+      if (A.roleStint(id)) Object.assign(patch, roleStintChange(id, null));
       await A.saveWorkspace(patch);
     } else {
       await adminAction('remove', id);
@@ -725,6 +954,8 @@
 
   /** Rename / describe / archive a channel. */
   A.setChannelOverride = async function (channelId, patch) {
+    const archiveOnly = Object.keys(patch || {}).length === 1 && patch.archived === true;
+    if (!A.can('ch.manage') && !(archiveOnly && A.can('ch.makePrivate'))) throw err('You aren’t allowed to change channels.');
     await adminAction('channel', channelId, { patch });
   };
 
@@ -738,13 +969,23 @@
     return { admins, formerAdmins: former };
   }
 
+  /** Workspace patch that ends someone's custom-role stint and optionally starts a new one. */
+  function roleStintChange(id, next) {
+    const holders = Object.assign({}, A.ws.roleHolders);
+    const former = Object.assign({}, A.ws.formerRoleHolders);
+    const cur = holders[id];
+    if (cur) former[id] = (former[id] || []).concat([{ role: cur.role, kid: cur.kid, since: cur.since, until: Date.now(), perms: cur.perms, scope: cur.scope }]).slice(-10);
+    if (next) holders[id] = next; else delete holders[id];
+    return { roleHolders: holders, formerRoleHolders: former };
+  }
+
   /** Super admin: make someone an admin. */
   A.appointAdmin = async function (id) {
     if (!A.isOwner()) throw err('Only the super admin can appoint admins.');
     const u = await A.loadUser(id);
     if (!u || A.isRemoved(id)) throw err('User not found');
     if (A.isUserAdmin(id)) throw err(`${u.name} is already an admin.`);
-    await A.saveWorkspace(stintChange(id, { kid: u.kid, since: Date.now() }));
+    await A.saveWorkspace(Object.assign(stintChange(id, { kid: u.kid, since: Date.now() }), A.roleStint(id) ? roleStintChange(id, null) : {}));
   };
   /** Super admin: take admin rights away. Actions they took while admin stay in effect. */
   A.revokeAdmin = async function (id) {
@@ -764,7 +1005,7 @@
   const badAudit = new Set();
 
   A.audit = async function (kind, ref, count, secret) {
-    if (!A.isAdmin() || A.isOwner() || !A.AUDIT_KINDS.includes(kind)) return;
+    if ((!A.isAdmin() && !A.hasCustomRole()) || A.isOwner() || !A.AUDIT_KINDS.includes(kind)) return;
     const ts = Date.now();
     const id = `${ts}_${A.me.id}_${U.rand(4)}`;
     const raw = { v: 1, id, kind, ref: String(ref || ''), count: Number(count) || 0, userId: A.me.id, ts, kid: A.me.signFp };
@@ -787,7 +1028,7 @@
       if (!raw) return;
       if (raw.id !== p.id || raw.userId !== p.userId || raw.ts !== p.ts || !A.AUDIT_KINDS.includes(raw.kind)) { badAudit.add(n); return; }
       const key = await actorKey(raw.userId, raw.kid);
-      if (!key || !(await C.verify(key, raw)) || !A.canActAt(raw.userId, raw.kid, raw.ts)) { badAudit.add(n); return; }
+      if (!key || !(await C.verify(key, raw)) || !A.privilegedAt(raw.userId, raw.kid, raw.ts)) { badAudit.add(n); return; }
       let secret = {};
       try { secret = await C.unseal(A.me.priv.ecdh, raw.sealed, 'sankyo-audit|' + raw.id); } catch { /* shown without the name */ }
       A.auditLog.set(n, { id: raw.id, kind: raw.kind, userId: raw.userId, ts: raw.ts, ref: String(raw.ref || ''), count: Number(raw.count) || 0,

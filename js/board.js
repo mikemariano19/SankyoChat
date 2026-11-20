@@ -122,7 +122,7 @@
       const shapeOk = raw.type === 'board' && raw.project === pid && raw.id === id && raw.userId === pn.userId && raw.ts === pn.ts;
       if (!shapeOk || !(await Y.verifyRaw(raw))) { done.add(key); continue; }
       // signer not known as an admin here (yet), e.g. this PC hasn't read the new workspace.json: re-check later
-      if (!A.canActAt(raw.userId, raw.kid, raw.ts)) continue;
+      if (!A.canAt(raw.userId, raw.kid, raw.ts, 'board.manage')) continue;
       const f = clean(raw);
       done.add(key);
       if (!f) continue;
@@ -222,10 +222,10 @@
   /* ================= queries ================= */
 
   /** The boards I can open: my own group's, or every group's for the super admin. */
-  B.boards = () => (!A.me ? [] : A.teamList().filter(t => A.isOwner() || A.teamOf(me()) === t.id));
+  B.boards = () => (!A.me ? [] : A.teamList().filter(t => A.isOwner() || A.teamOf(me()) === t.id || (A.can('board.manage') && !A.ownGroupOnly('board.manage'))));
   B.canSee = team => B.boards().some(t => t.id === team);
   /** Admins manage their own group's board; the super admin manages every board. */
-  B.canEdit = team => !!A.me && A.isAdmin() && (A.isOwner() || (!!team && A.teamOf(me()) === team));
+  B.canEdit = team => !!A.me && (A.isOwner() || (!!team && A.can('board.manage', { team })));
   B.get = pid => B.projects.get(pid) || null;
   B.inTeam = team => Array.from(B.projects.values()).filter(p => p.team === team);
   B.inCol = (col, team) => B.inTeam(team).filter(p => p.col === col).sort((a, b) => a.order - b.order || a.created - b.created);
@@ -238,7 +238,7 @@
   B.inGroup = (uid, team) => !!team && (A.teamOf(uid) === team || (!!A.ws && uid === A.ws.adminId));
   B.assignable = team => A.activeUsers().filter(u => B.inGroup(u.id, team));
   /** Admins and the super admin: the people who can be named as the superior. */
-  B.superiors = team => A.activeUsers().filter(u => !!A.roleLabel(u.id) && B.inGroup(u.id, team));
+  B.superiors = team => A.activeUsers().filter(u => (A.isUserAdmin(u.id) || A.userCan(u.id, 'board.manage', { team })) && B.inGroup(u.id, team));
   /** Days until the deadline (negative = late), or null. */
   B.daysLeft = function (deadline) {
     if (!deadline) return null;

@@ -3,6 +3,9 @@
 data/*
 !data/README.txt
 data-backup-*/
+data-replaced-*/
+# Per-PC backup settings (where this PC saves its hourly backups)
+backup/backup-settings.json
 
 # Editor / OS clutter
 .vscode/

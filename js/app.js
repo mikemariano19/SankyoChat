@@ -7,7 +7,7 @@
   const App = {};
 
   SC.APP_FILES = ['index.html', 'check.html', 'css/app.css', 'js/version.js', 'js/util.js', 'js/store.js', 'js/crypto.js',
-    'js/account.js', 'js/sync.js', 'js/notify.js', 'js/board.js', 'js/emoji.js', 'js/ui.js', 'js/board-ui.js', 'js/chat.js', 'js/app.js', 'js/check.js'];
+    'js/account.js', 'js/sync.js', 'js/notify.js', 'js/board.js', 'js/emoji.js', 'js/ui.js', 'js/board-ui.js', 'js/backup.js', 'js/roles-ui.js', 'js/chat.js', 'js/app.js', 'js/check.js'];
 
   const dataPath = () => U.dataPathFromLocation(location.href);
   const connectedLabel = () => {
@@ -195,10 +195,18 @@
       return showConnect('The shared folder couldn’t be read (' + (e.message || e.name) + '). Check you’re connected to the office network, then try again.');
     }
     if (r.status === 'missing') {
-      if (await A.folderIsEmpty()) {
-        return UI.screenCreateWorkspace({ connected: connectedLabel(), onBack: () => showConnect(), onSubmit: async vals => { await A.createWorkspace(vals); await enterChat(); } });
+      if (await SC.backup.dataFolderGone()) {
+        await S.forgetHandle();
+        return showConnect('The data folder was deleted or moved. In the folder window, go to the SankyoChat folder, make a new empty folder named “data” (New folder button), open it and click Select folder. You can then restore it from a backup.');
       }
+      // empty, or the workspace file is gone but other data folders are left (e.g. a half-finished restore)
+      const leftovers = (await S.list('', 'directory')).some(n => ['users', 'channels', 'admin'].includes(n));
+      if (await A.folderIsEmpty() || leftovers) return showEmptyData();
       return showConnect(`“${S.getRoot().name}” isn’t the Sankyo Chat data folder. Pick the “data” folder inside the SankyoChat folder.`);
+    }
+    if (await SC.backup.isBackupCopy()) {
+      await S.forgetHandle();
+      return showConnect(`“${S.getRoot().name}” is a backup copy, not the data folder. Connect the real “data” folder. If it’s empty or was deleted, the app offers to copy a backup into it, so the backup itself is never used directly.`);
     }
     if (r.status === 'different') {
       return UI.screenProblem({
@@ -218,6 +226,18 @@
     try { await A.refreshUsers(); await A.refreshAdminLog(); } catch (e) { console.warn(e); }
     if (await A.restoreSession()) return enterChat();
     showSignIn();
+  }
+  /** The data folder is empty: offer the super admin a restore before anyone can start a new workspace over it. */
+  function showEmptyData() {
+    const pin = U.ls.get('wsPin');
+    const known = pin && U.ls.get('ws.' + pin.id);
+    return SC.backup.screenEmpty({
+      knownWorkspace: known && known.name,
+      onRestored: () => afterConnect(),
+      onBack: async () => { await S.forgetHandle(); showConnect(); },
+      onNewWorkspace: () => UI.screenCreateWorkspace({ connected: connectedLabel(), onBack: () => showEmptyData(),
+        onSubmit: async vals => { await A.createWorkspace(vals); await enterChat(); } }),
+    });
   }
   const h2btn = (label, fn, primary) => UI.h('button', { class: 'btn' + (primary ? ' btn-primary' : ''), onclick: fn }, label);
 
@@ -292,6 +312,7 @@
       return showConnect('Couldn’t load messages from the shared folder (' + (e.message || e.name) + ').');
     }
     Chat.mount();
+    SC.backup.start().catch(e => console.warn('backup', e));
     resealSoon();
     lastInput = Date.now();
     watchIdle();
@@ -308,7 +329,7 @@
     clearInterval(versionTimer);
     const id = A.me && A.me.id;
     if (Chat.mounted()) Chat.unmount();
-    SC.notify.stop(); SC.board.stop();
+    SC.notify.stop(); SC.board.stop(); SC.backup.stop();
     await Y.stop(true);
     await A.lock();
     showSignIn(id, notice);
