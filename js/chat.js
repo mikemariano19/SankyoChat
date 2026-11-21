@@ -458,8 +458,10 @@
     }
     if (A.isOwner() && A.maintenance()) {
       list.push(h('div', { class: 'banner danger', role: 'status' }, icon('refresh'),
-        h('span', null, h('b', null, 'Update mode is on. '), 'Everyone else is disconnected and waiting. Copy the new app files onto the share (never over the data folder), then click Finish update.'),
-        h('button', { class: 'btn btn-sm btn-primary', onclick: () => finishUpdate() }, 'Finish update')));
+        h('span', null, h('b', null, 'Update mode is on. '), 'Everyone else is disconnected and waiting. Open the updater and install the new version, then click Finish update.'),
+        h('span', { style: { marginLeft: 'auto', display: 'flex', gap: '8px', flexWrap: 'wrap' } },
+          updaterLink('btn btn-sm btn-primary'),
+          h('button', { class: 'btn btn-sm', onclick: () => finishUpdate() }, 'Finish update'))));
     }
     if (A.isOwner()) {
       const bk = SC.backup.state();
@@ -2538,19 +2540,20 @@
     function updateSection() {
       const on = !!A.maintenance();
       const msg = h('input', { class: 'input', id: 'ad-maint', maxlength: 200, placeholder: 'Optional message, e.g. “Back in 10 minutes.”' });
-      const btn = h('button', { class: on ? 'btn btn-primary' : 'btn btn-danger' }, icon('refresh'), on ? 'Finish update' : 'Start update');
+      const btn = h('button', { class: on ? 'btn' : 'btn btn-danger' }, icon('refresh'), on ? 'Finish update' : 'Start update');
       btn.addEventListener('click', async () => {
         if (on) { m.close(); return finishUpdate(); }
         if (!(await UI.confirm({ title: 'Start update mode?', ok: 'Disconnect everyone', danger: true,
           text: 'Within a few seconds everyone else sees “Sankyo Chat is being updated” and stops reading or writing the shared drive. Messages they were typing stay on their PC. When you click Finish update, their app reloads with the new files.' }))) return;
-        try { await A.setMaintenance(true, msg.value); m.close(); UI.toast('Update mode is on. Copy the new files now.', 'ok'); schedule('banners'); } catch (e) { UI.toast(e.message, 'error'); }
+        try { await A.setMaintenance(true, msg.value); m.close(); UI.toast('Update mode is on. Now click Open the updater.', 'ok'); schedule('banners'); } catch (e) { UI.toast(e.message, 'error'); }
       });
       return h('div', { class: 'group-names' }, h('h3', null, 'Update the app'),
         h('p', { class: 'muted', style: { fontSize: '13px' } }, on
-          ? 'Update mode is on: everyone else is disconnected. Copy the new app files over the SankyoChat folder (never over data), then click Finish update.'
-          : 'Before you copy a new version onto the share, start update mode. It notifies everyone and disconnects them, so nobody writes to the share while files change. Apps older than 1.9 don’t know this mode: the first time, ask people to reload.'),
+          ? 'Update mode is on: everyone else is disconnected. Click Open the updater, choose the update package and install it. When the updater says it’s installed, click Finish update.'
+          : 'Updating takes three steps: Start update (everyone is told and disconnected, so nobody writes to the share while files change), Open the updater to install the new version, then Finish update. Apps older than 1.9 don’t know update mode: the first time, ask people to reload.'),
         on ? null : h('div', { class: 'field' }, h('label', { for: 'ad-maint' }, 'Message to show'), msg),
-        btn);
+        h('div', { class: 'row', style: { gap: '10px', flexWrap: 'wrap' } }, btn, on ? updaterLink('btn btn-primary') : null),
+        h('p', { class: 'hint', style: { marginTop: '10px' } }, 'Open the updater does nothing? On this PC, open the SankyoChat folder → update and double-click “Set up updater button” once. When the browser asks to open Windows PowerShell, tick “Always allow” and click Open. The updater is also in that folder: “Update Sankyo Chat”.'));
     }
     function groupNames() {
       const err = h('div', { class: 'form-error hidden', role: 'alert' });
@@ -2944,6 +2947,9 @@
 
   /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
   const NEWS = [
+    { version: '1.13.0', items: [
+      ['download', 'The updater', 'Super admin: Admin settings → Settings → Update the app. Click Start update, then Open the updater, and choose the update package. It replaces only the app files, never the data folder, and keeps the old version so you can undo. Set up the button once on your PC: in the SankyoChat folder, open update and double-click “Set up updater button”.'],
+    ] },
     { version: '1.12.0', items: [
       ['shield', 'Roles and permissions', 'Super admin: Admin settings → Roles shows what the super admin, admins and every custom role can do. Create roles like Moderator or Group leader and tick what they may do: announcements, channels, pins, hiding, polls, groups and project boards. Password resets, removing people and real names stay with admins.'],
       ['users', 'Give people a role', 'Admin settings → People has a Role dropdown for each person: Staff, a custom role, or Admin. There’s always exactly one super admin; Admin and custom roles have no limit.'],
@@ -2988,9 +2994,16 @@
 
   /* ================= update mode (super admin) ================= */
 
+  /* The updater is a Windows program (update\Update Sankyo Chat.bat): a web page can't start programs or
+   * replace its own files. This link uses the sankyo-update: link type that update\Set up updater button.bat
+   * registers for the super admin's Windows account. The link carries no data; the updater ignores it. */
+  function updaterLink(cls) {
+    return h('a', { class: cls, href: 'sankyo-update:open', title: 'Opens the Sankyo Chat Updater on this PC' }, icon('download'), 'Open the updater');
+  }
+
   async function finishUpdate() {
     if (!(await UI.confirm({ title: 'Finish the update?', ok: 'Finish and reload',
-      text: 'Make sure all the new app files are copied. Everyone’s app reloads with the new version within a few seconds, and so does yours.' }))) return;
+      text: 'Make sure the updater says the new version is installed. Everyone’s app reloads with the new version within a few seconds, and so does yours.' }))) return;
     try { await A.setMaintenance(false); location.reload(); } catch (e) { UI.toast(e.message, 'error'); }
   }
 

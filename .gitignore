@@ -4,6 +4,9 @@ data/*
 !data/README.txt
 data-backup-*/
 data-replaced-*/
+# Updater work folder (old-version copies, log) and built update packages
+_updates/
+dist/
 # Per-PC backup settings (where this PC saves its hourly backups)
 backup/backup-settings.json
 

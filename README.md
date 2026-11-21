@@ -4,10 +4,11 @@ A team chat app made of plain HTML, CSS and JavaScript. It runs with no internet
 
 **Requirements:** Microsoft Edge or Google Chrome, version 110 or newer. Nothing gets installed.
 
-**Current version:** 1.12.0 (`js/version.js`)
+**Current version:** 1.13.0 (`js/version.js`)
 
 ### What's new
 
+- **1.13: Updater.** Instead of deleting and copying files by hand, the super admin clicks Start update, then **Open the updater**, and picks the update package. The updater replaces only the app files, can't touch `data`, and keeps the old version so it can be undone. See [Updating](#updating).
 - **1.12: Roles and permissions.** Admin settings → Roles shows what the super admin, admins and each custom role can do. The super admin creates roles such as Moderator or Group leader and gives them to people from the People tab. Password resets, removing people and real names stay with admins. See [Roles and permissions](#roles-and-permissions-112).
 - **1.11: Backups.** The super admin picks a backup folder. Every hour the app saves what changed into one folder per day. If the data folder is ever emptied or deleted, the app offers to copy a backup back in. See [Backups](#backups-111).
 
@@ -15,7 +16,7 @@ A team chat app made of plain HTML, CSS and JavaScript. It runs with no internet
 
 1. Copy this whole `SankyoChat` folder to the share, for example `\\fileserver\Shared\SankyoChat\`.
 2. Permissions:
-   - App files (`index.html`, `check.html`, `css`, `js`, `assets`): **read-only** for staff. Only you or IT can change them. Anyone who can edit the code could make it capture passwords.
+   - App files (`index.html`, `check.html`, `css`, `js`, `assets`, `backup`, `update`): **read-only** for staff. Only you or IT can change them. Anyone who can edit the code could make it capture passwords.
    - `data` folder: **Modify** for the staff group only.
 3. Turn on **backups**: after step 5, open ⚙ → Admin settings → **Backups** and choose a folder on the shared storage outside the SankyoChat folder (see [Backups](#backups-111)). Previous Versions (shadow copies) on the share add another layer. A copy of `data` is a full backup, and DMs stay encrypted in it.
 4. Give staff a desktop shortcut to `\\fileserver\Shared\SankyoChat\index.html`, set to open in Edge or Chrome.
@@ -26,9 +27,23 @@ When a PC has problems, open `check.html`. It tests the browser, folder access (
 
 ### Updating
 
+Use the updater instead of deleting and copying files by hand. It replaces only the app's code and can't write to, move or delete `data`.
+
+**On your PC, make the package:** raise `APP_VERSION` in `js/version.js`, add an entry to `NEWS` in `js/chat.js` for the What's new pop-up, then double-click `tools\Make update package.bat`. It writes `dist\SankyoChat-update-<version>.zip`. Each file in it gets a SHA-256 fingerprint in `sankyo-update.json`, and the tool won't build a version that isn't newer than the last one in `dist`.
+
+**In the office:**
+
 1. Super admin: ⚙ → Admin settings → Settings → **Update the app** → **Start update**. Within about 5 seconds every other app (1.9 or newer) shows "Sankyo Chat is being updated" and stops reading and writing the share.
-2. Copy the new files over the app folder (raise `APP_VERSION` in `js/version.js`, and add an entry to `NEWS` in `js/chat.js` for the What's new pop-up). Never copy anything over `data`.
-3. Click **Finish update** (in the red banner). Everyone's app reloads with the new files.
+2. Click **Open the updater** (in the red banner, or under Update the app), or double-click `update\Update Sankyo Chat.bat` (or drop the zip onto it), and choose the zip. The updater checks every file, shows what will be replaced, added and removed, and what is never touched, then backs up `data` (if hourly backup is set up on that PC) and installs. Run it from a Windows account that may change the app files.
+3. Click **Finish update** (in the red banner). Everyone's app reloads with the new files. Then save the new trusted fingerprint (⚙ → Admin settings → App files).
+
+What keeps `data` safe: the updater only writes the app files on its allowlist (`index.html`, `check.html`, `README.md`, `data\README.txt`, `css\`, `js\`, `assets\`, and the `.ps1`/`.bat` tools in `backup\` and `update\`). It refuses the whole package if any file is outside that list, aimed at `data`, damaged, not listed in the manifest, or not a newer version. It deletes single files the previous version installed, never folders. Before changing anything it copies the old files into `_updates\app-<version>-<time>`. After installing it checks every file again and checks that no file has gone missing from `data`. If anything is off, it puts the old version back by itself. `update\Undo last update.bat` does the same by hand. Everything is logged in `_updates\update-log.txt`. The newest 5 old-version copies are kept.
+
+From the command line (IT, testing): `update\SankyoUpdate.ps1 -NoGui -Package <zip> [-WhatIf] [-Yes] [-NoBackup]`, and `-NoGui -Undo`.
+
+**The Open the updater button:** a web page can't start programs, so the button is a `sankyo-update:` link. Make it work once on the super admin's PC: double-click `update\Set up updater button.bat` **from the SankyoChat folder on the share**. This registers the link for that Windows account only (no admin rights needed) and points it at that copy of the updater. The first time you click the button, the browser asks to open Windows PowerShell: tick **Always allow** and click **Open**. The link carries no data, so a web page could at most open the updater window, which still needs you to choose a package and confirm. `Remove updater button.bat` undoes it. If the SankyoChat folder moves, run the setup again.
+
+**First time:** the office copy doesn't have the `update` folder yet. Copy just that folder into `SankyoChat` on the share, then run it as above. On this first run it removes nothing, because it doesn't yet have a list of the installed files.
 
 Apps older than 1.9 don't know update mode. For the first rollout of 1.9, copy the files, then ask everyone to reload (they also see "A new version is available. Reload" within 5 minutes).
 
