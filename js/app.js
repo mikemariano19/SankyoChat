@@ -147,15 +147,30 @@
     return '';
   }
 
+  /** Resolves to `fallback` if `p` hasn't settled within `ms` (a stuck IndexedDB or folder handle must not freeze startup). */
+  const within = (p, ms, fallback) => Promise.race([p, new Promise(r => setTimeout(() => r(fallback), ms))]);
+  const TIMED_OUT = Symbol('timeout');
+
   App.boot = async function () {
+    try { await bootInner(); } catch (e) {
+      console.error('Startup failed', e);
+      showConnect('Startup hit a problem (' + (e.message || e.name) + '). Connect the shared folder again.');
+    }
+  };
+  async function bootInner() {
     applyTheme();
     const why = supported();
     if (why) return UI.screenUnsupported(why);
     UI.screenLoading('Starting Sankyo Chat…');
-    const h = await S.loadHandle();
+    const h = await within(S.loadHandle(), 6000, TIMED_OUT);
+    if (h === TIMED_OUT) {
+      console.warn('Reading the remembered folder from IndexedDB timed out');
+      return showConnect('The browser’s saved data for this app isn’t responding. Close other Sankyo Chat tabs and try again, or connect the folder below.');
+    }
     if (!h) return showConnect();
     S.setRoot(h);
-    const perm = await S.queryPermission(h);
+    const perm = await within(S.queryPermission(h), 6000, 'timeout');
+    if (perm === 'timeout') console.warn('Checking folder permission timed out (shared drive unreachable?)');
     if (perm === 'granted') return afterConnect();
     UI.screenReconnect({
       name: h.name,
@@ -166,7 +181,7 @@
       },
       onChoose: () => showConnect(),
     });
-  };
+  }
 
   function showConnect(error) {
     UI.screenConnect({
@@ -181,7 +196,7 @@
           throw new Error('The app needs permission to view and edit files in that folder.');
         }
         S.setRoot(h);
-        await S.saveHandle(h);
+        await within(S.saveHandle(h), 4000, false); // if browser storage is stuck, still open the app this session
         await afterConnect();
       },
     });

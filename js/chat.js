@@ -2947,6 +2947,9 @@
 
   /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
   const NEWS = [
+    { version: '1.14.0', items: [
+      ['refresh', 'Startup no longer gets stuck', 'If the browser’s saved data or the shared drive doesn’t answer when the app starts, you now see the Connect or Reconnect screen after a few seconds instead of an endless “Starting Sankyo Chat…”.'],
+    ] },
     { version: '1.13.0', items: [
       ['download', 'The updater', 'Super admin: Admin settings → Settings → Update the app. Click Start update, then Open the updater, and choose the update package. It replaces only the app files, never the data folder, and keeps the old version so you can undo. Set up the button once on your PC: in the SankyoChat folder, open update and double-click “Set up updater button”.'],
     ] },

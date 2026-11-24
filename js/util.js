@@ -180,6 +180,7 @@
         r.onupgradeneeded = () => { r.result.createObjectStore('kv'); r.result.createObjectStore('cache'); };
         r.onsuccess = () => resolve(r.result);
         r.onerror = () => reject(r.error);
+        r.onblocked = () => reject(new Error('IndexedDB is blocked by another tab'));
       });
       dbp.catch(() => { dbp = null; });
     }

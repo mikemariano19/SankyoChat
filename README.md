@@ -4,10 +4,11 @@ A team chat app made of plain HTML, CSS and JavaScript. It runs with no internet
 
 **Requirements:** Microsoft Edge or Google Chrome, version 110 or newer. Nothing gets installed.
 
-**Current version:** 1.13.0 (`js/version.js`)
+**Current version:** 1.14.0 (`js/version.js`)
 
 ### What's new
 
+- **1.14: No more endless "Starting Sankyo Chat…".** If the browser's saved data or the shared drive stops answering at startup, the app now shows the Connect or Reconnect screen after a few seconds instead of spinning forever.
 - **1.13: Updater.** Instead of deleting and copying files by hand, the super admin clicks Start update, then **Open the updater**, and picks the update package. The updater replaces only the app files, can't touch `data`, and keeps the old version so it can be undone. See [Updating](#updating).
 - **1.12: Roles and permissions.** Admin settings → Roles shows what the super admin, admins and each custom role can do. The super admin creates roles such as Moderator or Group leader and gives them to people from the People tab. Password resets, removing people and real names stay with admins. See [Roles and permissions](#roles-and-permissions-112).
 - **1.11: Backups.** The super admin picks a backup folder. Every hour the app saves what changed into one folder per day. If the data folder is ever emptied or deleted, the app offers to copy a backup back in. See [Backups](#backups-111).
