@@ -1162,3 +1162,15 @@ input, textarea, select, [contenteditable="true"] { caret-color: auto; }
 .cal-times.hidden { display: none; }
 @media (max-width: 520px) { .cal-scroll { --row: 56px; } .cal-chip { font-size: 0; height: 6px; padding: 0; border-left-width: 0; background: var(--cal); } .cal-times { grid-template-columns: 1fr; } }
 @media (prefers-reduced-motion: reduce) { .cal-day, .cal-chip { transition: none; } }
+
+/* ---------- 1.16: polls in announcements ---------- */
+.ann-poll { margin-top: 10px; max-width: 100%; }
+.ann-card .ann-poll, .ann-pop .ann-poll { width: min(460px, 100%); }
+.ann-opt { display: flex; flex-direction: column; gap: 4px; }
+.ann-voters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 0 2px 2px 4px; min-height: 26px; }
+.ann-voters .ann-face { box-shadow: 0 0 0 2px var(--surface); }
+.tabs .tab-n.grey { background: var(--surface-2); color: var(--muted); }
+.ann-poll-edit { margin-top: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); display: flex; flex-direction: column; gap: 8px; }
+.ann-poll-edit .label { display: inline-flex; align-items: center; gap: 6px; }
+.ann-poll-edit .poll-edit { margin: 0; }
+.ann-pop-poll .ann-poll { margin: 4px 0 8px; }

@@ -2141,6 +2141,7 @@
             a.title ? h('div', { class: 'ann-title' }, a.title) : null,
             a.text ? h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, a.mentions || []) }) : null,
             a.attachments && a.attachments.length ? h('div', { class: 'ann-pics' }, renderAttachments({ attachments: a.attachments })) : null,
+            a.poll ? annPollBlock(a) : null,
             reach,
             // shown on hover (and keyboard focus) at the card's corner, like the tools on chat messages
             admin ? h('div', { class: 'msg-tools ann-tools', role: 'toolbar', 'aria-label': 'Announcement actions' },
@@ -2155,6 +2156,64 @@
     } else box.scrollTop = keepTop;
     loadAnnPics(box);
     ackVisibleAnnouncements();
+  }
+
+  /* ---- polls in announcements (1.16) ----
+   * Staff vote (one vote each, which they can change or take back); admins, the super admin and the author see
+   * the results. Each option shows the faces of the last five people who picked it; "See more" lists them all. */
+  const VOTE_FACES = 5;
+  function annPollBlock(a) {
+    const r = Y.annPollResults(a);
+    const mineV = Y.annVote(a);
+    const can = Y.canVoteAnn(a);
+    return h('div', { class: 'poll ann-poll' },
+      h('div', { class: 'poll-head' }, icon('poll'), h('span', null, 'Poll'), h('span', { class: 'muted' }, ' · staff vote, one vote each')),
+      a.poll.question ? h('div', { class: 'poll-q' }, a.poll.question) : null,
+      h('div', { class: 'poll-opts', role: 'radiogroup', 'aria-label': 'Poll options' }, a.poll.options.map(o => {
+        const voters = r.byOption.get(o.id) || [];
+        const pct = r.voters ? Math.round(voters.length * 100 / r.voters) : 0;
+        const picked = mineV === o.id;
+        const faces = voters.slice(0, VOTE_FACES).map(id => A.users.get(id)).filter(Boolean);
+        return h('div', { class: 'ann-opt' },
+          h('button', { class: 'poll-opt' + (picked ? ' picked' : ''), type: 'button', 'data-action': 'ann-vote', 'data-opt': o.id, disabled: !can, role: 'radio', 'aria-checked': String(picked),
+            title: can ? (picked ? 'Click again to take your vote back' : 'Vote for this') : 'Only staff vote' },
+          h('span', { class: 'poll-fill', style: { width: pct + '%' } }),
+          h('span', { class: 'poll-check' }, picked ? icon('check') : null),
+          h('span', { class: 'poll-txt' }, o.text),
+          h('span', { class: 'poll-n' }, voters.length ? `${voters.length} · ${pct}%` : '0')),
+          faces.length ? h('div', { class: 'ann-voters' },
+            h('span', { class: 'ann-faces', role: 'img', 'aria-label': 'Voted: ' + faces.map(u => u.name).join(', ') + (voters.length > faces.length ? ` and ${voters.length - faces.length} more` : '') },
+              faces.map(u => h('span', { class: 'ann-face', title: `${u.name} · ${U.formatDateTime(r.at(u.id))}` }, UI.avatar(u, 22)))),
+            voters.length > VOTE_FACES ? h('button', { class: 'link-btn ann-seen-more', type: 'button', 'data-action': 'ann-votes', 'data-opt': o.id }, `See more (+${voters.length - VOTE_FACES})`) : null) : null);
+      })),
+      h('div', { class: 'poll-foot' }, `${r.voters} ${r.voters === 1 ? 'person' : 'people'} voted` +
+        (can ? (mineV ? ' · pick another option to change your vote' : '') : A.me && a.userId === meId() ? ' · you posted it, so you see the results' : ' · only staff vote')));
+  }
+  function onAnnPoll(t, a) {
+    if (!a || !a.poll) return;
+    if (t.dataset.action === 'ann-votes') return votesDialog(a, t.dataset.opt);
+    Y.voteAnnouncement(a.id, t.dataset.opt).then(c => { if (!c) UI.toast('Vote taken back'); }).catch(e => UI.toast(e.message, 'error'));
+  }
+  /** Everyone who voted, option by option. */
+  function votesDialog(a, opt) {
+    let tab = opt || a.poll.options[0].id;
+    const tabs = h('div', { class: 'tabs', role: 'tablist' });
+    const list = h('div', { class: 'people-list seen-list' });
+    function draw() {
+      if (!Y.announcements.has(a.id)) return m.close();
+      const r = Y.announcementReach(a);
+      const res = Y.annPollResults(a);
+      UI.set(tabs, a.poll.options.map(o => h('button', { role: 'tab', 'aria-selected': String(tab === o.id), title: o.text, onclick: () => { tab = o.id; draw(); } },
+        o.text.length > 24 ? o.text.slice(0, 23) + '…' : o.text, h('span', { class: 'tab-n grey' }, String((res.byOption.get(o.id) || []).length)))));
+      const ids = res.byOption.get(tab) || [];
+      UI.set(list, ids.length ? ids.map(id => A.users.get(id)).filter(Boolean).map(u => h('div', { class: 'person', onclick: () => profileDialog(u.id) }, UI.avatar(u, 32),
+        h('div', { style: { flex: 1, minWidth: 0 } }, h('div', { class: 'nm' }, u.name), h('div', { class: 'sub' }, 'Voted ' + U.formatDateTime(res.at(u.id))))))
+        : h('div', { class: 'muted', style: { padding: '10px' } }, 'Nobody picked this yet.'),
+      h('div', { class: 'muted', style: { fontSize: '13px', padding: '8px 2px 0' } }, `${res.voters} of ${r.audience.filter(u => !A.isUserAdmin(u.id)).length} staff voted.`));
+    }
+    const unsub = Y.events.on('announcements', draw);
+    const m = UI.modal({ title: a.poll.question ? `Votes: ${a.poll.question}` : 'Votes', cls: 'mid', body: [tabs, list], onClose: unsub });
+    draw();
   }
 
   /* ---- who has seen an announcement (admins) ----
@@ -2203,6 +2262,7 @@
     if (t.dataset.action === 'profile') { const a = Y.announcements.get(row.dataset.ann); if (a) profileCard(a.userId, t); return; }
     if (t.dataset.action === 'open-att') return openAnnPicture(Y.announcements.get(row.dataset.ann), Number(t.dataset.i), t.dataset.save === '1');
     if (t.dataset.action === 'ann-seen') return seenDialog(Y.announcements.get(row.dataset.ann));
+    if (t.dataset.action === 'ann-vote' || t.dataset.action === 'ann-votes') return onAnnPoll(t, Y.announcements.get(row.dataset.ann));
     if (!canAnnounce()) return;
     if (t.dataset.action === 'ann-edit') return editAnnouncementDialog(Y.announcements.get(row.dataset.ann));
     if (t.dataset.action !== 'ann-withdraw') return;
@@ -2224,6 +2284,8 @@
     let goView = false;
     const u = A.users.get(a.userId);
     const more = pending.length - 1;
+    const pollBox = a.poll ? h('div', { class: 'ann-pop-poll', onclick: e => { const t = e.target.closest('[data-action]'); if (t) onAnnPoll(t, Y.announcements.get(a.id)); } }, annPollBlock(a)) : null;
+    const pollUnsub = pollBox ? Y.events.on('announcements', () => { const cur = Y.announcements.get(a.id); if (cur && cur.poll) UI.set(pollBox, annPollBlock(cur)); }) : null;
     const m = UI.modal({ title: a.title || 'Announcement', cls: 'mid ann-pop', body: [
       h('div', { class: 'row', style: { gap: '10px', marginBottom: '12px' } }, UI.avatar(u, 32),
         h('div', null, h('div', { style: { fontWeight: '600' } }, A.name(a.userId)), h('div', { class: 'muted', style: { fontSize: '13px' } }, (A.roleLabel(a.userId) || 'Admin') + ' · ' + U.formatDateTime(a.ts) + (a.to ? ' · sent privately to you' + (a.to.length > 2 ? ` and ${a.to.length - 2} others` : '') : '')))),
@@ -2232,19 +2294,21 @@
         const t = e.target.closest('[data-action="open-att"]');
         if (t) openAnnPicture(a, Number(t.dataset.i), t.dataset.save === '1');
       } }, renderAttachments({ attachments: a.attachments })) : null,
+      pollBox,
       (a.mentions || []).includes(meId()) ? h('p', { class: 'ann-later' }, icon('at'), 'You were mentioned in this announcement.') : null,
       h('p', { class: 'ann-later' }, icon('megaphone'), `You can read this again any time in ${feedName(feedOf(a))}, at the top of the sidebar.` + (more ? ` ${more} more after this one.` : ''))],
     foot: [
       h('button', { class: 'btn', onclick: () => { goView = true; m.close(); } }, feedOf(a) ? `Open ${feedName(feedOf(a))}` : 'View all announcements'),
       h('button', { class: 'btn btn-primary', onclick: () => m.close() }, icon('x'), 'Close')],
     onClose: () => {
+      if (pollUnsub) pollUnsub();
       if (!st.unmounting) Y.ackAnnouncement(a.id);
       st.annOpen = false;
       if (st.unmounting) return;
       if (goView) Chat.open(annKey(feedOf(a))); else setTimeout(showPendingAnnouncement, 300);
     } });
     loadAnnPics(m.el);
-    SC.app.notify({ title: 'Announcement: ' + (a.title || A.name(a.userId)), body: a.text ? a.text.slice(0, 140) : `📷 ${a.attachments.length} ${a.attachments.length === 1 ? 'picture' : 'pictures'}`, tag: 'ann-' + a.id });
+    SC.app.notify({ title: 'Announcement: ' + (a.title || A.name(a.userId)), body: a.text ? a.text.slice(0, 140) : a.poll ? '📊 Poll: ' + (a.poll.question || a.poll.options.map(o => o.text).join(' / ')).slice(0, 140) : `📷 ${a.attachments.length} ${a.attachments.length === 1 ? 'picture' : 'pictures'}`, tag: 'ann-' + a.id });
   }
 
   /** Admins and the super admin can create polls in any conversation they're in. */
@@ -2316,6 +2380,35 @@
       const files = Array.from(e.clipboardData ? e.clipboardData.files : []);
       if (files.length) { e.preventDefault(); addPics(files); }
     });
+    // poll (1.16): staff vote on it; admins see the results
+    let pollOn = false;
+    const pollQ = h('input', { class: 'input', id: 'an-poll-q', maxlength: 300, placeholder: 'Question (optional), e.g. Which day suits you?' });
+    const pollOpts = ['', ''];
+    const pollList = h('div', { class: 'poll-edit' });
+    const pollAdd = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => {
+      if (pollOpts.length >= Y.MAX_POLL_OPTIONS) return;
+      pollOpts.push(''); drawPoll();
+      const inputs = pollList.querySelectorAll('input'); inputs[inputs.length - 1].focus();
+    } }, icon('plus'), 'Add option');
+    function drawPoll() {
+      UI.set(pollList, pollOpts.map((v, i) => h('div', { class: 'poll-edit-row' },
+        h('input', { class: 'input', value: v, maxlength: 100, placeholder: `Option ${i + 1}`, 'aria-label': `Poll option ${i + 1}`, oninput: e => { pollOpts[i] = e.target.value; } }),
+        pollOpts.length > 2 ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': `Remove option ${i + 1}`, title: 'Remove', onclick: () => { pollOpts.splice(i, 1); drawPoll(); } }, icon('x')) : null)));
+      pollAdd.disabled = pollOpts.length >= Y.MAX_POLL_OPTIONS;
+    }
+    drawPoll();
+    const pollBox = h('div', { class: 'ann-poll-edit hidden' },
+      h('div', { class: 'row', style: { justifyContent: 'space-between', marginBottom: '6px' } }, h('span', { class: 'label', style: { margin: 0 } }, icon('poll'), ' Poll'),
+        h('button', { class: 'link-btn', type: 'button', onclick: () => setPoll(false) }, 'Remove poll')),
+      pollQ, pollList, h('div', null, pollAdd),
+      h('div', { class: 'hint' }, 'Staff get one vote each and can change it. Admins see the results. Everyone sees who picked what.'));
+    const pollBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => setPoll(true) }, icon('poll'), 'Add a poll');
+    function setPoll(on) {
+      pollOn = on;
+      pollBox.classList.toggle('hidden', !on);
+      pollBtn.classList.toggle('hidden', on);
+      if (on) pollQ.focus();
+    }
     const ok = h('button', { class: 'btn btn-primary' }, icon('megaphone'));
     // admins can only send private announcements inside their own group; the super admin to anyone
     const scope = Y.announceTeam();
@@ -2390,7 +2483,8 @@
     if (preset.team) { priv = true; drawSeg(); const s = sources.find(x => x.key === 'team:' + preset.team); if (s) toggleSource(s); }
     ok.addEventListener('click', () => UI.busy(ok, null, async () => {
       const n = pp.picked.size;
-      const id = await Y.postAnnouncement({ title: title.value, text: text.value, to: priv ? Array.from(pp.picked) : undefined, label, files: pics });
+      const id = await Y.postAnnouncement({ title: title.value, text: text.value, to: priv ? Array.from(pp.picked) : undefined, label, files: pics,
+        poll: pollOn ? { question: pollQ.value, options: pollOpts } : null });
       const f = feedOf(Y.announcements.get(id));
       m.close(); UI.toast(priv ? `Announcement sent to ${n} ${n === 1 ? 'person' : 'people'}` + (f ? ` · in ${feedName(f)}` : '') : 'Announcement posted', 'ok');
       if (isAnn() && annFeed() !== f) Chat.open(annKey(f));
@@ -2400,7 +2494,8 @@
       people,
       h('div', { class: 'field' }, h('label', { for: 'an-title' }, 'Title (optional)'), title),
       h('div', { class: 'field' }, h('label', { for: 'an-text' }, 'Message'), text, picBox,
-        h('div', { class: 'row', style: { gap: '8px', margin: '6px 0 2px' } }, picBtn, h('span', { class: 'hint', style: { margin: 0 } }, `Up to ${Y.MAX_ANN_FILES} pictures, 5 MB each. You can also paste them.`), picInput),
+        h('div', { class: 'row', style: { gap: '8px', margin: '6px 0 2px', flexWrap: 'wrap' } }, picBtn, pollBtn, h('span', { class: 'hint', style: { margin: 0 } }, `Up to ${Y.MAX_ANN_FILES} pictures, 5 MB each. You can also paste them.`), picInput),
+        pollBox,
         hint)],
     foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok],
     onClose: () => { pics.forEach(forgetLocalUrl); closeMention(); } });
@@ -2509,7 +2604,7 @@
     const where = t => h('span', { class: 'guide-where' }, t);
     const sections = [
       ['Announcements', 'megaphone', [
-        ['Post to everyone', 'A pop-up for all staff, kept in Announcements for a year. Add pictures and @mention people (they get a notification). You can see who has read it.', openIn('New announcement', newAnnouncementDialog), 'ann.post'],
+        ['Post to everyone', 'A pop-up for all staff, kept in Announcements for a year. Add pictures, a poll, and @mention people (they get a notification). You can see who has read it.', openIn('New announcement', newAnnouncementDialog), 'ann.post'],
         ['Announce privately', 'Send it only to chosen people (encrypted for them). Use “Add everyone in…” to send to a whole private channel or group at once.', openIn('New announcement', newAnnouncementDialog), 'ann.private'],
         ['Withdraw an announcement', 'It disappears for everyone.', where('Announcements → hover it → 🗑'), 'ann.withdraw'],
       ]],
@@ -3163,6 +3258,9 @@
 
   /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
   const NEWS = [
+    { version: '1.16.0', items: [
+      ['poll', 'Polls in announcements', 'Admins can add a poll to any announcement (New announcement → Add a poll). Staff vote right in the pop-up or in Announcements, and can change their vote. Each option shows who picked it: five faces, then “See more”.'],
+    ] },
     { version: '1.15.0', items: [
       ['image', 'Pictures and @mentions in announcements', 'Admins can add up to 10 pictures to an announcement, and type @ to mention someone. The people mentioned get a notification in the bell.'],
       ['check', 'See who has seen an announcement', 'Admins see the faces of the last five people who saw it. “See more” lists everyone who has seen it, and who hasn’t yet.'],

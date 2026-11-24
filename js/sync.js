@@ -1547,11 +1547,12 @@
       }
       const team = to && typeof raw.team === 'string' && /^[a-z0-9]{1,8}$/.test(raw.team) ? raw.team : null;
       Y.announcements.set(id, { id, userId: raw.userId, ts: raw.ts, title: String(body.title || '').slice(0, 120), text: String(body.text || '').slice(0, Y.MAX_TEXT), to, team, kid: raw.kid,
-        mentions: cleanMentions(body.mentions, to), attachments: cleanAnnFiles(body.attachments, !!to) });
+        mentions: cleanMentions(body.mentions, to), attachments: cleanAnnFiles(body.attachments, !!to), poll: cleanAnnPoll(body.poll), votes: new Map() });
       changed = true;
     }
     for (const [id, a] of Y.announcements) if (a.ts < floor) { Y.announcements.delete(id); changed = true; }
     if (await readAnnouncementEdits()) changed = true;
+    if (await readAnnVotes()) changed = true;
     if (changed) Y.events.emit('announcements');
     return changed;
   }
@@ -1735,7 +1736,92 @@
   }
   const annFilePath = (a, att) => (a.to ? `${ANN_FILES}/${att.fileId}.bin` : att.path);
 
-  Y.postAnnouncement = async function ({ title, text, to, label, files }) {
+  /* ---- polls in announcements (1.16) ----
+   * An announcement can carry a poll: {question, options: [{id, text}]}, in the signed announcement (inside the
+   * encrypted part for a private one). Only staff vote: the people it was sent to, except admins, the super admin
+   * and its author, who see the results. Each voter writes their own file, announcements/votes/<announcementId>/
+   * <userId>.json, signed by them and overwritten when they change their vote (one writer per file):
+   * {choice: optionId, or '' when they take it back}, encrypted with the announcement's key for a private one.
+   * Every app checks the signature and that the voter may vote; the newest file per person counts. */
+  const VOTES = 'announcements/votes';
+  function cleanAnnPoll(p) {
+    if (!p || typeof p !== 'object' || !Array.isArray(p.options)) return null;
+    const options = p.options.slice(0, Y.MAX_POLL_OPTIONS).filter(o => o && /^o\d{1,2}$/.test(o.id) && typeof o.text === 'string' && o.text.trim())
+      .map(o => ({ id: o.id, text: o.text.replace(/\s+/g, ' ').trim().slice(0, 100) }));
+    if (options.length < 2 || new Set(options.map(o => o.id)).size !== options.length) return null;
+    return { question: typeof p.question === 'string' ? p.question.replace(/\s+/g, ' ').trim().slice(0, 300) : '', options };
+  }
+  /** May this person vote in this announcement's poll? Staff it was sent to; not admins, the super admin or the author. */
+  const mayVote = (a, uid) => !!a.poll && uid !== a.userId && !A.isUserAdmin(uid) && !A.isRemoved(uid) && (!a.to || a.to.includes(uid));
+  Y.canVoteAnn = a => !!a && !!A.me && mayVote(a, me());
+  /** My vote: an option id, or ''. */
+  Y.annVote = a => { const v = a && a.votes && a.votes.get(me()); return v ? v.choice : ''; };
+  /** Per option: who voted for it, the latest vote first. */
+  Y.annPollResults = function (a) {
+    const byOption = new Map(a.poll.options.map(o => [o.id, []]));
+    const list = Array.from(a.votes || []).filter(([uid, v]) => v.choice && byOption.has(v.choice) && mayVote(a, uid)).sort((x, y) => y[1].ts - x[1].ts);
+    for (const [uid, v] of list) byOption.get(v.choice).push(uid);
+    return { byOption, voters: list.length, at: uid => { const v = a.votes.get(uid); return v ? v.ts : 0; } };
+  };
+  const voteMtimes = new Map(); // `${annId}/${file}` → lastModified
+  async function readAnnVotes() {
+    let changed = false;
+    for (const a of Y.announcements.values()) {
+      if (!a.poll) continue;
+      const names = (await S.list(`${VOTES}/${a.id}`, 'file')).filter(n => /^[a-z0-9]{4}\.json$/.test(n));
+      for (const n of names) {
+        const uid = n.slice(0, 4), key = a.id + '/' + n;
+        const r = await S.readJSONIfChanged(`${VOTES}/${a.id}/${n}`, voteMtimes.get(key));
+        if (r.unchanged || r.missing || !r.data) continue;
+        voteMtimes.set(key, r.lastModified);
+        const raw = r.data;
+        if (raw.type !== 'ann-vote' || raw.ann !== a.id || raw.userId !== uid || typeof raw.ts !== 'number') continue;
+        const prev = a.votes.get(uid);
+        if (prev && prev.ts >= raw.ts) continue;
+        if (!mayVote(a, uid) || !(await verifyRaw(raw))) continue;
+        let choice = raw.choice;
+        if (a.to) {
+          const k = annKeys.get(a.id);
+          if (!k || !raw.enc) continue;
+          try { ({ choice } = await C.decryptJSON(k, raw.enc, 'annvote|' + a.id + '|' + uid + '|' + raw.ts)); } catch { continue; }
+        }
+        if (choice !== '' && !a.poll.options.some(o => o.id === choice)) continue;
+        a.votes.set(uid, { choice, ts: raw.ts });
+        changed = true;
+      }
+    }
+    return changed;
+  }
+  /** Vote for an option; picking my current choice again takes the vote back. */
+  Y.voteAnnouncement = async function (id, optionId) {
+    const a = Y.announcements.get(id);
+    if (!a || !a.poll) throw err('That poll is no longer there.');
+    if (!Y.canVoteAnn(a)) throw err(A.isAdmin() ? 'Admins see the results. Only staff vote.' : 'You can’t vote in this poll.');
+    if (!a.poll.options.some(o => o.id === optionId)) throw err('That option is no longer there.');
+    if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
+    const choice = Y.annVote(a) === optionId ? '' : optionId;
+    const prev = a.votes.get(me());
+    const ts = Math.max(Date.now(), prev ? prev.ts + 1 : 0);
+    const raw = { v: 1, type: 'ann-vote', ann: id, userId: me(), ts, kid: A.me.signFp };
+    if (a.to) {
+      const k = annKeys.get(id);
+      if (!k) throw err('This poll can’t be answered from this PC.');
+      raw.enc = await C.encryptJSON(k, { choice }, 'annvote|' + id + '|' + me() + '|' + ts);
+    } else raw.choice = choice;
+    raw.sig = await C.sign(A.me.priv.sign, raw);
+    const path = `${VOTES}/${id}/${me()}.json`;
+    await S.writeJSON(path, raw);
+    const f = await S.readFile(path).catch(() => null);
+    if (f) voteMtimes.set(id + '/' + me() + '.json', f.lastModified);
+    a.votes.set(me(), { choice, ts });
+    if (!mine.acks[id]) mine.acks[id] = Date.now(); // voting counts as having seen it
+    annHint = Math.max(annHint, ts);
+    noteMyPost(ANN_KEY, ts);
+    Y.events.emit('announcements');
+    return choice;
+  };
+
+  Y.postAnnouncement = async function ({ title, text, to, label, files, poll }) {
     if (!A.can(Array.isArray(to) ? 'ann.private' : 'ann.post')) throw err(Array.isArray(to) ? 'You aren’t allowed to send private announcements.' : 'You aren’t allowed to post announcements to everyone.');
     if (Array.isArray(to)) {
       const t = Y.announceTeam();
@@ -1747,7 +1833,18 @@
     title = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
     text = String(text || '').trim();
     files = Array.from(files || []);
-    if (!text && !files.length) throw err('Write the announcement first.');
+    let cleanPoll = null;
+    if (poll) {
+      const question = String(poll.question || '').replace(/\s+/g, ' ').trim();
+      const texts = (poll.options || []).map(o => String(o || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+      if (question.length > 300) throw err('Poll questions can be at most 300 characters.');
+      if (texts.length < 2) throw err('Give the poll at least two options.');
+      if (texts.length > Y.MAX_POLL_OPTIONS) throw err(`Polls can have up to ${Y.MAX_POLL_OPTIONS} options.`);
+      if (new Set(texts.map(t => t.toLowerCase())).size !== texts.length) throw err('Two poll options are the same.');
+      if (texts.some(t => t.length > 100)) throw err('Poll options can be at most 100 characters.');
+      cleanPoll = { question, options: texts.map((t, i) => ({ id: 'o' + (i + 1), text: t })) };
+    }
+    if (!text && !files.length && !cleanPoll) throw err('Write the announcement first.');
     if (text.length > Y.MAX_TEXT) throw err(`Announcements can be up to ${Y.MAX_TEXT} characters.`);
     if (files.length > Y.MAX_ANN_FILES) throw err(`Attach at most ${Y.MAX_ANN_FILES} pictures.`);
     const notPic = files.find(f => !isPic(f.type));
@@ -1779,14 +1876,14 @@
     }
     const mentions = Y.announcementMentions(text, recipients);
     const attachments = await uploadAnnFiles(id, files, aes);
-    if (aes) raw.enc = await C.encryptJSON(aes, { title, text, mentions, attachments }, 'ann|' + id);
-    else { raw.mentions = mentions; raw.attachments = attachments; }
+    if (aes) raw.enc = await C.encryptJSON(aes, Object.assign({ title, text, mentions, attachments }, cleanPoll ? { poll: cleanPoll } : null), 'ann|' + id);
+    else { raw.mentions = mentions; raw.attachments = attachments; if (cleanPoll) raw.poll = cleanPoll; }
     raw.sig = await C.sign(A.me.priv.sign, raw);
     try { await S.writeJSON(`announcements/${id}.json`, raw); } catch (e) {
       for (const a of attachments) S.remove(recipients ? `${ANN_FILES}/${a.fileId}.bin` : a.path).catch(() => {});
       throw e;
     }
-    Y.announcements.set(id, { id, userId: me(), ts, title, text, to: recipients, team: raw.team || null, mentions, attachments });
+    Y.announcements.set(id, { id, userId: me(), ts, title, text, to: recipients, team: raw.team || null, mentions, attachments, poll: cleanPoll, votes: new Map() });
     annHint = Math.max(annHint, ts);
     noteMyPost(ANN_KEY, ts);
     Y.events.emit('announcements');
@@ -1802,6 +1899,7 @@
     await S.remove(`announcements/${id}.json`);
     await S.remove(`announcements/edits/${id}.json`).catch(() => {});
     for (const att of a.attachments || []) await S.remove(annFilePath(a, att)).catch(() => {});
+    if (a.poll) await S.remove(`${VOTES}/${id}`, true).catch(() => {});
     Y.announcements.delete(id);
     const ts = Date.now();
     annHint = Math.max(annHint, ts);
