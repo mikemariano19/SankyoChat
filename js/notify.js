@@ -17,14 +17,14 @@
 
   /** Which tab each type belongs to. */
   const CAT = {
-    mention: 'mentions', reply: 'mentions', here: 'mentions',
+    mention: 'mentions', reply: 'mentions', here: 'mentions', annMention: 'mentions',
     added: 'groups', removed: 'groups', gadmin: 'groups', gadminOff: 'groups', reqResult: 'groups',
     request: 'requests', leave: 'requests', team: 'requests', newUser: 'requests',
     adm: 'admin', aud: 'admin', chan: 'admin', ann: 'admin',
   };
   N.category = it => CAT[it.type] || 'groups';
   /** Types rebuilt from their source on every refresh (not saved on this PC). */
-  const DERIVED = new Set(['request', 'team', 'newUser', 'adm', 'aud', 'chan', 'ann']);
+  const DERIVED = new Set(['request', 'team', 'newUser', 'adm', 'aud', 'chan', 'ann', 'annMention']);
 
   /** @type {Map<string, any>} */
   const items = new Map();
@@ -47,8 +47,10 @@
 
   /* ================= preferences ================= */
 
-  N.PREF_LABELS = { mentions: 'Mentions and replies', groups: 'Added to or removed from groups', requests: 'Requests and approvals', admin: 'Admin activity (super admin)', board: 'Project board: new projects, Checking and Done' };
-  N.prefs = () => Object.assign({ mentions: true, groups: true, requests: true, admin: true, board: true }, U.ls.get(key('notifPrefs'), {}));
+  N.PREF_LABELS = { mentions: 'Mentions and replies (also in announcements)', groups: 'Added to or removed from groups', requests: 'Requests and approvals', admin: 'Admin activity (super admin)', board: 'Project board: new projects, Checking and Done',
+    dms: 'Direct messages', groupMsgs: 'Group chats and private channels', channels: 'Every message in public channels', calendar: 'Calendar: new and changed events' };
+  /** Message pop-ups by kind of conversation (1.15). Public channels are off by default: only mentions pop up there. */
+  N.prefs = () => Object.assign({ mentions: true, groups: true, requests: true, admin: true, board: true, dms: true, groupMsgs: true, channels: false, calendar: true }, U.ls.get(key('notifPrefs'), {}));
   N.setPref = (k, on) => { const p = N.prefs(); p[k] = !!on; U.ls.set(key('notifPrefs'), p); };
   N.dndUntil = () => { const t = A.me ? U.ls.get(key('dnd'), 0) : 0; return t > Date.now() ? t : 0; };
   N.setDnd = until => { U.ls.set(key('dnd'), until || 0); N.events.emit('change'); };
@@ -125,6 +127,7 @@
       case 'mention': return { title: `${who} mentioned you in ${conv}`, sub: quote };
       case 'reply': return { title: `${who} replied to you in ${conv}`, sub: quote };
       case 'here': return { title: `${who} notified everyone in ${conv}`, sub: quote };
+      case 'annMention': return { title: `${who} mentioned you in an announcement`, sub: quote };
       case 'added': return { title: who ? `${who} added you to ${conv}` : `You were added to ${conv}`, sub: it.pc ? 'Private channel' : 'Group chat' };
       case 'removed': return { title: `You were removed from ${conv}`, sub: 'You won’t get new messages from it.' };
       case 'gadmin': return { title: `You’re now ${it.pc ? 'a channel' : 'a group'} admin of ${conv}`, sub: 'You can rename it, add people and remove regular members.' };
@@ -182,6 +185,21 @@
         text: m.decryptError ? '' : (m.text || (m.attachments.length ? '📎 Attachment' : '')), publicText: ch.kind === 'public' });
     }
   }
+
+  /** Announcements that mention me (1.15). Rebuilt from the announcements themselves, so a withdrawn one disappears
+   *  and a private one's text is never saved on this PC. */
+  function deriveAnnMentions() {
+    if (!A.me) return;
+    const lo = Math.max(floor(), baseline());
+    const live = new Set();
+    for (const a of Y.announcementList()) {
+      if (a.userId === me() || !(a.ts >= lo) || !(a.mentions || []).includes(me())) continue;
+      live.add('am:' + a.id);
+      add({ id: 'am:' + a.id, type: 'annMention', ts: a.ts, actor: a.userId, ann: a.id, text: (a.title ? a.title + ': ' : '') + a.text });
+    }
+    drop(it => it.type === 'annMention' && !live.has(it.id));
+  }
+  const deriveAnnSoon = U.debounce(deriveAnnMentions, 300);
 
   /* ================= groups: added, removed, admin rights ================= */
 
@@ -524,12 +542,13 @@
       Y.events.on('groupGone', ch => { checking.delete(ch.id); scanSoon(); }),
       Y.events.on('groupLeave', onLeave),
       Y.events.on('presence', onPresence),
-      Y.events.on('announcements', () => { if (A.isOwner()) deriveSoon(); }),
+      Y.events.on('announcements', () => { if (A.isOwner()) deriveSoon(); deriveAnnSoon(); }),
       Y.events.on('started', () => {
         started = true;
         // first run of this version: everything that happened before counts as read
         if (!U.ls.get(key('notifInit')) ) { U.ls.set(key('notifInit'), Date.now()); if (!Y.notifRead()) Y.markNotifs(Date.now()); }
         scanGroups();
+        deriveAnnMentions();
         refresh().finally(() => { ready = true; changed(); });
       }),
       A.events.on('workspace', deriveSoon),

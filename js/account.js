@@ -130,7 +130,7 @@
     ['ann.post', 'role'], ['ann.private', 'role'], ['ann.withdraw', 'role'],
     ['ch.create', 'role'], ['ch.createPrivate', 'role'], ['ch.manage', 'role'], ['ch.makePrivate', 'role'],
     ['msg.hide', 'role'], ['msg.pin', 'role'], ['msg.poll', 'role'],
-    ['grp.accept', 'role'], ['board.manage', 'role'], ['grp.rename', 'super'],
+    ['grp.accept', 'role'], ['board.manage', 'role'], ['grp.rename', 'super'], ['cal.manage', 'role'],
     ['log.view', 'role'], ['ppl.realname', 'admin'], ['ppl.reset', 'admin'], ['ppl.remove', 'admin'],
     ['sec.roles', 'super'], ['ws.settings', 'super'], ['ws.update', 'super'], ['ws.backup', 'super'], ['ws.files', 'super'], ['ws.feedback', 'super'],
   ].map(([id, tier]) => ({ id, tier }));

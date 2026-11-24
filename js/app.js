@@ -7,7 +7,7 @@
   const App = {};
 
   SC.APP_FILES = ['index.html', 'check.html', 'css/app.css', 'js/version.js', 'js/util.js', 'js/store.js', 'js/crypto.js',
-    'js/account.js', 'js/sync.js', 'js/notify.js', 'js/board.js', 'js/emoji.js', 'js/ui.js', 'js/board-ui.js', 'js/backup.js', 'js/roles-ui.js', 'js/chat.js', 'js/app.js', 'js/check.js'];
+    'js/account.js', 'js/sync.js', 'js/notify.js', 'js/board.js', 'js/calendar.js', 'js/emoji.js', 'js/ui.js', 'js/board-ui.js', 'js/calendar-ui.js', 'js/backup.js', 'js/roles-ui.js', 'js/chat.js', 'js/app.js', 'js/check.js'];
 
   const dataPath = () => U.dataPathFromLocation(location.href);
   const connectedLabel = () => {
@@ -319,10 +319,10 @@
     }
     if (A.maintenance() && !A.isOwner()) return showMaintenance();
     UI.screenLoading('Loading your messages…');
-    SC.notify.start(); SC.board.start();
+    SC.notify.start(); SC.board.start(); SC.calendar.start();
     try { await Y.start(); } catch (e) {
       console.warn(e);
-      SC.notify.stop(); SC.board.stop();
+      SC.notify.stop(); SC.board.stop(); SC.calendar.stop();
       await Y.stop();
       return showConnect('Couldn’t load messages from the shared folder (' + (e.message || e.name) + ').');
     }
@@ -344,7 +344,7 @@
     clearInterval(versionTimer);
     const id = A.me && A.me.id;
     if (Chat.mounted()) Chat.unmount();
-    SC.notify.stop(); SC.board.stop(); SC.backup.stop();
+    SC.notify.stop(); SC.board.stop(); SC.calendar.stop(); SC.backup.stop();
     await Y.stop(true);
     await A.lock();
     showSignIn(id, notice);
@@ -358,7 +358,7 @@
     clearInterval(maintTimer);
     clearInterval(idleTimer);
     if (Chat.mounted()) Chat.unmount();
-    SC.notify.stop(); SC.board.stop();
+    SC.notify.stop(); SC.board.stop(); SC.calendar.stop();
     try { await Y.stop(true); } catch { /* already stopped */ }
     const m = A.maintenance() || {};
     const check = async () => {

@@ -37,7 +37,7 @@
   const groupMiss = new Map(); // group id → newest activity ts when we last found we weren't a member (re-checked on newer activity)
   const discovering = new Map();
   let readMap = {};
-  let mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {}, boardRead: 0 };
+  let mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {}, boardRead: 0, calRead: 0 };
   let running = false;
   let timer = 0;
 
@@ -92,14 +92,133 @@
     if (Y.isPrivateChannel(ch)) return { name: ch.groupName || 'private-channel', description: ch.groupDesc || '', archived: false, private: true };
     return { name: ch.groupName || names.join(', '), description: ch.groupName ? names.join(', ') : '', archived: false };
   };
-  Y.isMuted = id => !!U.ls.get(`muted.${A.ws.id}.${me()}`, {})[id];
-  Y.setMuted = function (id, on) {
-    const k = `muted.${A.ws.id}.${me()}`;
-    const m = U.ls.get(k, {});
-    if (on) m[id] = true; else delete m[id];
-    U.ls.set(k, m);
+  /* ================= my conversation settings (1.15) =================
+   * Pin, mute, archive, "Delete chat" and block live in prefs/<myId>.json: encrypted with a key only I can work out
+   * (ECDH between my own two keys) and signed, so they follow me to other PCs and nobody else can read them, not
+   * even whom I blocked. One writer (me, on any PC); the newest ts wins, and each change is re-applied on top of
+   * the newest copy before it's written.
+   *   pinned, muted, archived: {conversationId: ts}
+   *   cleared: {conversationId: ts}: "Delete chat" hides every message up to ts, for me only
+   *   blocked: {userId: {since, periods: [[from, to], …]}}: their direct messages from those times are hidden for me.
+   * Blocking is silent: nothing is written where they could see it, so they can't tell. Their messages never show
+   * "Seen", because I never read them. */
+  const emptyPrefs = () => ({ pinned: {}, muted: {}, archived: {}, cleared: {}, blocked: {} });
+  let prefs = emptyPrefs(), prefsTs = 0, prefsMtime = 0, prefsQueue = Promise.resolve();
+  const prefsPath = () => `prefs/${me()}.json`;
+  const prefsAad = ts => 'prefs|' + me() + '|' + ts;
+  async function prefsKey() {
+    const u = A.users.get(me()) || await A.loadUser(me());
+    if (!u) throw err('Unknown user');
+    return C.pairKey(A.me.priv.ecdh, u.keys.ecdh, 'sankyo-prefs|' + me());
+  }
+  function cleanPrefs(o) {
+    const out = emptyPrefs();
+    if (!o || typeof o !== 'object') return out;
+    for (const k of ['pinned', 'muted', 'archived', 'cleared']) {
+      const src = o[k] && typeof o[k] === 'object' ? o[k] : {};
+      for (const [id, v] of Object.entries(src)) if (ID_RE.test(id) && typeof v === 'number') out[k][id] = v;
+    }
+    const b = o.blocked && typeof o.blocked === 'object' ? o.blocked : {};
+    for (const [uid, v] of Object.entries(b)) {
+      if (!/^[a-z0-9]{4}$/.test(uid) || !v || typeof v !== 'object') continue;
+      const periods = (Array.isArray(v.periods) ? v.periods : []).filter(p => Array.isArray(p) && typeof p[0] === 'number' && typeof p[1] === 'number').slice(-20);
+      out.blocked[uid] = { since: typeof v.since === 'number' ? v.since : 0, periods };
+    }
+    return out;
+  }
+  /** Settings changed: unread counts, the sidebar and the open conversation all depend on them. */
+  function afterPrefs() {
+    for (const ch of chans.values()) bump(ch);
     Y.events.emit('channels');
-  };
+    Y.events.emit('prefs');
+  }
+  /** Read my settings file if it changed (another PC of mine may have written it). */
+  async function loadPrefs() {
+    if (!A.me) return false;
+    const r = await S.readJSONIfChanged(prefsPath(), prefsMtime);
+    if (r.unchanged || r.missing) return false;
+    prefsMtime = r.lastModified || 0;
+    const raw = r.data;
+    if (!raw || raw.type !== 'prefs' || raw.userId !== me() || typeof raw.ts !== 'number' || raw.ts <= prefsTs || !raw.enc) return false;
+    // written for my previous key (before a password reset): it can't be opened any more, start again
+    if (raw.fp !== A.me.ecdhFp || !(await verifyRaw(raw))) return false;
+    let body;
+    try { body = await C.decryptJSON(await prefsKey(), raw.enc, prefsAad(raw.ts)); } catch { return false; }
+    prefs = cleanPrefs(body);
+    prefsTs = raw.ts;
+    afterPrefs();
+    return true;
+  }
+  Y.refreshPrefs = () => loadPrefs().catch(handleErr);
+  /** Change my settings: shown at once, then written on top of the newest copy. `fn` must set absolute values,
+   *  because it runs twice (now, and again after the newest copy is read). */
+  function changePrefs(fn) {
+    fn(prefs);
+    afterPrefs();
+    const who = A.me;
+    const run = prefsQueue.catch(() => {}).then(async () => {
+      if (A.me !== who) return;
+      if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
+      await loadPrefs().catch(() => {});
+      fn(prefs);
+      const ts = prefsTs = Math.max(Date.now(), prefsTs + 1);
+      const raw = { v: 1, type: 'prefs', userId: me(), ts, kid: A.me.signFp, fp: A.me.ecdhFp };
+      raw.enc = await C.encryptJSON(await prefsKey(), prefs, prefsAad(ts));
+      raw.sig = await C.sign(A.me.priv.sign, raw);
+      await S.writeJSON(prefsPath(), raw);
+      const f = await S.readFile(prefsPath()).catch(() => null);
+      if (f) prefsMtime = f.lastModified; // my own write isn't news
+      afterPrefs();
+    });
+    prefsQueue = run;
+    return run.catch(e => { handleErr(e); throw err(friendly(e)); });
+  }
+  /** Before 1.15, mutes were kept on each PC only: carry them over once. */
+  function migrateLocalMutes() {
+    const k = `muted.${A.ws.id}.${me()}`;
+    const old = U.ls.get(k, null);
+    if (!old || typeof old !== 'object') return;
+    const ids = Object.keys(old).filter(id => old[id] && ID_RE.test(id) && !prefs.muted[id]);
+    U.ls.del(k);
+    if (ids.length) changePrefs(p => { ids.forEach(id => { p.muted[id] = p.muted[id] || Date.now(); }); }).catch(() => {});
+  }
+
+  const setFlag = (k, id, on) => changePrefs(p => { if (on) p[k][id] = p[k][id] || Date.now(); else delete p[k][id]; });
+  Y.isMuted = id => !!prefs.muted[id];
+  Y.setMuted = (id, on) => setFlag('muted', id, on);
+  /** Pinned conversations stay at the top of their list. */
+  Y.isChatPinned = id => !!prefs.pinned[id];
+  Y.setChatPinned = (id, on) => setFlag('pinned', id, on);
+  /** Archived conversations move to "Archived" at the bottom of Direct messages. */
+  Y.isArchived = id => !!prefs.archived[id];
+  Y.setArchived = (id, on) => setFlag('archived', id, on);
+  /** "Delete chat": hides everything so far, for me only, and takes it out of the sidebar until a new message comes. */
+  Y.clearedTo = id => prefs.cleared[id] || 0;
+  Y.deleteChat = ch => changePrefs(p => {
+    let last = Date.now();
+    for (const m of ch.msgs.values()) if (m.ts > last) last = m.ts;
+    p.cleared[ch.id] = Math.max(p.cleared[ch.id] || 0, last);
+    delete p.pinned[ch.id]; delete p.archived[ch.id];
+  });
+  /** A cleared conversation with nothing newer stays out of the sidebar. */
+  Y.isChatDeleted = ch => !!prefs.cleared[ch.id] && !(ch.lastActivity > prefs.cleared[ch.id]) && !ch.outbox.length;
+  Y.isBlocked = uid => !!(prefs.blocked[uid] && prefs.blocked[uid].since);
+  Y.blockedList = () => Object.keys(prefs.blocked).filter(Y.isBlocked);
+  Y.setBlocked = (uid, on) => changePrefs(p => {
+    const b = p.blocked[uid] || { since: 0, periods: [] };
+    if (on && !b.since) b.since = Date.now();
+    if (!on && b.since) { b.periods.push([b.since, Date.now()]); b.since = 0; }
+    p.blocked[uid] = b;
+  });
+  function blockedAt(uid, ts) {
+    const b = prefs.blocked[uid];
+    if (!b) return false;
+    if (b.since && ts >= b.since) return true;
+    return b.periods.some(([from, to]) => ts >= from && ts <= to);
+  }
+  /** Hidden for me only: from before "Delete chat", or a direct message from someone I had blocked at the time. */
+  const hiddenMsg = (ch, m) => m.ts <= (prefs.cleared[ch.id] || 0) || (ch.kind === 'dm' && m.userId !== me() && blockedAt(m.userId, m.ts));
+  Y.isHiddenMsg = hiddenMsg;
 
   /* ================= keys ================= */
 
@@ -360,9 +479,10 @@
     const added = [];
     for (const m of items) if (apply(ch, m)) added.push(m);
     bump(ch, opts.quiet);
-    if (added.length && chans.get(ch.id) === ch) Y.events.emit('loaded', { ch, msgs: added });
+    const visible = added.filter(m => !hiddenMsg(ch, m));
+    if (visible.length && chans.get(ch.id) === ch) Y.events.emit('loaded', { ch, msgs: visible });
     if (!opts.quiet) {
-      const incoming = added.filter(m => m.ts > Y.startedAt && m.userId !== me());
+      const incoming = visible.filter(m => m.ts > Y.startedAt && m.userId !== me());
       if (incoming.length && chans.get(ch.id) === ch) Y.events.emit('incoming', { ch, msgs: incoming });
     }
     return added;
@@ -403,7 +523,7 @@
   Y.sorted = function (ch) {
     if (ch._sortedV !== ch.version) {
       const now = Date.now();
-      ch._sorted = Array.from(ch.msgs.values()).filter(m => !m.expires || m.expires > now)
+      ch._sorted = Array.from(ch.msgs.values()).filter(m => (!m.expires || m.expires > now) && !hiddenMsg(ch, m))
         .sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : 1));
       ch._sortedV = ch.version;
     }
@@ -420,7 +540,7 @@
     const now = Date.now();
     let unread = 0, mentions = 0;
     for (const m of ch.msgs.values()) {
-      if (m.ts <= lr || m.userId === me() || m.deleted || m.hidden) continue;
+      if (m.ts <= lr || m.userId === me() || m.deleted || m.hidden || hiddenMsg(ch, m)) continue;
       if (m.expires && m.expires < now) continue;
       unread++;
       if (ch.kind !== 'public' || m.mentions.includes(me()) || m.mentions.includes('channel')) mentions++;
@@ -431,7 +551,8 @@
   }
   Y.markRead = function (ch) {
     let last = 0;
-    for (const m of ch.msgs.values()) if (m.ts > last) last = m.ts;
+    // messages hidden for me (a blocked person's) are never read, so they never show "Seen"
+    for (const m of ch.msgs.values()) if (m.ts > last && !hiddenMsg(ch, m)) last = m.ts;
     if (last > (readMap[ch.id] || 0)) {
       readMap[ch.id] = last;
       U.ls.set(readKeyName(), readMap);
@@ -579,6 +700,7 @@
     files = files || [];
     if (text.length > Y.MAX_TEXT) throw err(`Messages can be at most ${Y.MAX_TEXT.toLocaleString()} characters.`);
     if (!text.trim() && !files.length) return;
+    if (ch.kind === 'dm' && Y.isBlocked(Y.dmOther(ch))) throw err(`You blocked ${A.name(Y.dmOther(ch))}. Unblock them to send a message.`);
     if (files.length > Y.MAX_ATTACH) throw err(`Attach at most ${Y.MAX_ATTACH} files at a time.`);
     const big = files.find(f => f.size > Y.MAX_FILE);
     if (big) throw err(`“${big.name}” is over the 5 MB limit.`);
@@ -1116,7 +1238,7 @@
       for (const k of Object.keys(mine.lastPost)) if (mine.lastPost[k] < cutoff) delete mine.lastPost[k];
       for (const k of Object.keys(mine.notifSeen)) if (!(mine.notifSeen[k] >= Date.now() - 30 * U.DAY_MS)) delete mine.notifSeen[k];
       for (const k of Object.keys(mine.acks)) { const pn = U.parseMsgName(k + '.json'); if (!pn || pn.ts < Date.now() - Y.ANN_DAYS * U.DAY_MS) delete mine.acks[k]; }
-      const data = { v: 1, userId: uid, lastSeen: Date.now(), status: status || Y.myStatus(), statusText: mine.statusText, statusTs: mine.statusTs, lastPost: mine.lastPost, seen: mySeen(), acks: mine.acks, notifRead: mine.notifRead, notifSeen: mine.notifSeen, boardRead: mine.boardRead };
+      const data = { v: 1, userId: uid, lastSeen: Date.now(), status: status || Y.myStatus(), statusText: mine.statusText, statusTs: mine.statusTs, lastPost: mine.lastPost, seen: mySeen(), acks: mine.acks, notifRead: mine.notifRead, notifSeen: mine.notifSeen, boardRead: mine.boardRead, calRead: mine.calRead };
       await S.writeJSON(`presence/${uid}.json`, data);
       Y.presence.set(uid, { data, mtime: 0 });
     } catch (e) { handleErr(e); } finally {
@@ -1132,6 +1254,7 @@
   function mergeNotif(cur) {
     if (typeof cur.notifRead === 'number' && cur.notifRead > mine.notifRead) mine.notifRead = cur.notifRead;
     if (typeof cur.boardRead === 'number' && cur.boardRead > mine.boardRead) mine.boardRead = cur.boardRead;
+    if (typeof cur.calRead === 'number' && cur.calRead > mine.calRead) mine.calRead = cur.calRead;
     if (cur.notifSeen && typeof cur.notifSeen === 'object') {
       for (const [k, v] of Object.entries(cur.notifSeen)) if (typeof v === 'number' && !(mine.notifSeen[k] >= v)) mine.notifSeen[k] = v;
     }
@@ -1142,6 +1265,13 @@
   Y.markBoardRead = function (upTo) {
     if (!(upTo > mine.boardRead)) return false;
     mine.boardRead = upTo; heartbeat();
+    return true;
+  };
+  /** The calendar (js/calendar.js) has its own read-state too (1.15). */
+  Y.calRead = () => mine.calRead;
+  Y.markCalRead = function (upTo) {
+    if (!(upTo > mine.calRead)) return false;
+    mine.calRead = upTo; heartbeat();
     return true;
   };
   Y.notifSeen = id => !!mine.notifSeen[id];
@@ -1300,7 +1430,7 @@
       for (const step of [A.refreshWorkspace, A.refreshAdminLog, Y.refreshAnnouncements]) { try { await step(); } catch (e) { handleErr(e); } }
       if (await A.loadInbox()) Y.events.emit('inbox');
     } },
-    { every: 60000, fn: async () => { await A.refreshUsers(); await rescanChannels(); purgeExpired(); } },
+    { every: 60000, fn: async () => { await A.refreshUsers(); await rescanChannels(); purgeExpired(); await loadPrefs().catch(handleErr); } },
     { every: 3600000, fn: sweep, first: 15000 },
   ];
   async function runTask(t) {
@@ -1337,8 +1467,11 @@
     Y.startedAt = Date.now();
     Y.connected = true;
     readMap = U.ls.get(readKeyName(), {});
-    mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {}, boardRead: 0 };
+    mine = { lastPost: {}, statusText: '', statusTs: 0, acks: {}, notifRead: 0, notifSeen: {}, boardRead: 0, calRead: 0 };
     Y.announcements.clear(); badAnn.clear(); annHint = 0;
+    prefs = emptyPrefs(); prefsTs = 0; prefsMtime = 0; prefsQueue = Promise.resolve();
+    try { await loadPrefs(); } catch (e) { console.warn('prefs', e); }
+    migrateLocalMutes();
     const cur = await S.readJSON(`presence/${me()}.json`);
     if (cur && cur.userId === me()) {
       mine.lastPost = Object.assign({}, cur.lastPost);
@@ -1363,6 +1496,7 @@
     clearTimeout(timer);
     if (writeOffline && A.me) { try { await heartbeat('offline'); } catch { /* ignore */ } }
     chans.clear(); Y.presence.clear(); notMine.clear(); failed.clear(); groupMiss.clear();
+    prefs = emptyPrefs(); prefsTs = 0; prefsMtime = 0;
     Y.openId = null;
   };
 
@@ -1405,14 +1539,15 @@
       if (!ok) { badAnn.add(id); continue; }
       // not (yet) known as an admin here, e.g. this PC hasn't seen the new workspace.json: re-check later
       if (!A.canAt(raw.userId, raw.kid, raw.ts, Array.isArray(raw.to) ? 'ann.private' : 'ann.post')) continue;
-      let title = raw.title, text = raw.text, to = null;
+      let body = raw, to = null;
       if (Array.isArray(raw.to)) {
         if (!raw.to.includes(me())) { badAnn.add(id); continue; } // private, and not for me
-        try { ({ title, text } = await openPrivateAnnouncement(raw)); } catch (e) { console.warn('announcement', id, e); badAnn.add(id); continue; }
+        try { body = await openPrivateAnnouncement(raw); } catch (e) { console.warn('announcement', id, e); badAnn.add(id); continue; }
         to = raw.to.filter(x => typeof x === 'string');
       }
-      const team = to && typeof raw.team === 'string' && /^td$/.test(raw.team) ? raw.team : null;
-      Y.announcements.set(id, { id, userId: raw.userId, ts: raw.ts, title: String(title || '').slice(0, 120), text: String(text || '').slice(0, Y.MAX_TEXT), to, team, kid: raw.kid });
+      const team = to && typeof raw.team === 'string' && /^[a-z0-9]{1,8}$/.test(raw.team) ? raw.team : null;
+      Y.announcements.set(id, { id, userId: raw.userId, ts: raw.ts, title: String(body.title || '').slice(0, 120), text: String(body.text || '').slice(0, Y.MAX_TEXT), to, team, kid: raw.kid,
+        mentions: cleanMentions(body.mentions, to), attachments: cleanAnnFiles(body.attachments, !!to) });
       changed = true;
     }
     for (const [id, a] of Y.announcements) if (a.ts < floor) { Y.announcements.delete(id); changed = true; }
@@ -1440,14 +1575,16 @@
       const raw = r.data;
       if (raw.type !== 'ann-edit' || raw.target !== id || raw.userId !== a.userId || typeof raw.ts !== 'number' || raw.ts <= (a.editTs || 0)) continue;
       if (!(await verifyRaw(raw)) || !A.canAt(raw.userId, raw.kid, raw.ts, a.to ? 'ann.private' : 'ann.post')) continue;
-      let title = raw.title, text = raw.text;
+      let body = raw;
       if (a.to) {
         const k = annKeys.get(id);
         if (!k) continue;
-        try { ({ title, text } = await C.decryptJSON(k, raw.enc, 'annedit|' + id + '|' + raw.ts)); } catch { continue; }
+        try { body = await C.decryptJSON(k, raw.enc, 'annedit|' + id + '|' + raw.ts); } catch { continue; }
       }
-      if (typeof text !== 'string' || !text.trim()) continue;
+      const { title, text } = body;
+      if (typeof text !== 'string' || (!text.trim() && !(a.attachments && a.attachments.length))) continue;
       Object.assign(a, { title: String(title || '').slice(0, 120), text: text.slice(0, Y.MAX_TEXT), editTs: raw.ts });
+      if (Array.isArray(body.mentions)) a.mentions = cleanMentions(body.mentions, a.to);
       changed = true;
     }
     return changed;
@@ -1460,18 +1597,19 @@
     if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
     title = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
     text = String(text || '').trim();
-    if (!text) throw err('Write the announcement first.');
+    if (!text && !(a.attachments && a.attachments.length)) throw err('Write the announcement first.');
     if (text.length > Y.MAX_TEXT) throw err(`Announcements can be up to ${Y.MAX_TEXT} characters.`);
     const ts = Math.max(Date.now(), (a.editTs || 0) + 1);
+    const mentions = Y.announcementMentions(text, a.to);
     const raw = { v: 1, type: 'ann-edit', target: id, userId: me(), ts, kid: A.me.signFp, title: '', text: '' };
     if (a.to) {
       const k = annKeys.get(id);
       if (!k) throw err('This announcement can’t be edited from this PC.');
-      raw.enc = await C.encryptJSON(k, { title, text }, 'annedit|' + id + '|' + ts);
-    } else { raw.title = title; raw.text = text; }
+      raw.enc = await C.encryptJSON(k, { title, text, mentions }, 'annedit|' + id + '|' + ts);
+    } else { raw.title = title; raw.text = text; raw.mentions = mentions; }
     raw.sig = await C.sign(A.me.priv.sign, raw);
     await S.writeJSON(`announcements/edits/${id}.json`, raw);
-    Object.assign(a, { title, text, editTs: ts });
+    Object.assign(a, { title, text, mentions, editTs: ts });
     annHint = Math.max(annHint, ts);
     noteMyPost(ANN_KEY, ts);
     Y.events.emit('announcements');
@@ -1521,12 +1659,15 @@
   /** Who should see it (everyone active who existed when it was posted, except the author), and who has. */
   Y.announcementReach = function (a) {
     const audience = A.activeUsers().filter(u => u.id !== a.userId && (a.to ? a.to.includes(u.id) : !(u.created > a.ts)));
-    const seen = audience.filter(u => {
-      if (u.id === me()) return !!mine.acks[a.id];
+    const ackAt = u => {
+      if (u.id === me()) return mine.acks[a.id] || 0;
       const pr = Y.presence.get(u.id);
-      return !!(pr && pr.data && pr.data.acks && pr.data.acks[a.id]);
-    });
-    return { audience, seen };
+      const t = pr && pr.data && pr.data.acks && pr.data.acks[a.id];
+      return typeof t === 'number' ? t : 0;
+    };
+    // newest first, so the avatars show who saw it most recently
+    const seen = audience.filter(u => ackAt(u) > 0).sort((x, y) => ackAt(y) - ackAt(x));
+    return { audience, seen, ackAt: u => ackAt(u) };
   };
 
   /** `to`: user ids for a private announcement (only they can read it); omit for everyone. */
@@ -1535,7 +1676,66 @@
   Y.announceTeam = () => (A.isOwner() ? null : (A.teamOf(me()) || ''));
   Y.canAnnounceTo = id => { const t = Y.announceTeam(); return t === null || (!!t && A.teamOf(id) === t); };
 
-  Y.postAnnouncement = async function ({ title, text, to, label }) {
+  /* ---- pictures and @mentions in announcements (1.15) ----
+   * Pictures go in announcements/files/: <fileId>_<name> for one to everyone (plain, like channel files), or
+   * <fileId>.bin encrypted with the announcement's own key for a private one. The list of pictures and the
+   * mentioned people are in the signed announcement (inside the encrypted part for a private one). A mention
+   * only counts for someone who can read the announcement. */
+  Y.MAX_ANN_FILES = 10;
+  const ANN_FILES = 'announcements/files';
+  const isPic = t => /^image\/(png|jpe?g|gif|webp|bmp)$/i.test(t || '');
+  function cleanMentions(list, to) {
+    if (!Array.isArray(list)) return [];
+    return U.uniq(list.filter(x => typeof x === 'string' && /^[a-z0-9]{4}$/.test(x) && (!to || to.includes(x)))).slice(0, 60);
+  }
+  function cleanAnnFiles(list, priv) {
+    if (!Array.isArray(list)) return [];
+    return list.slice(0, Y.MAX_ANN_FILES).filter(a => a && /^[a-z0-9]{8}$/.test(a.fileId) && typeof a.name === 'string' && isPic(a.type)).map(a => {
+      const o = { fileId: a.fileId, name: a.name.slice(0, 200), size: Number(a.size) || 0, type: String(a.type).slice(0, 100) };
+      const w = Math.round(Number(a.w)), hgt = Math.round(Number(a.h));
+      if (w > 0 && hgt > 0 && w <= 20000 && hgt <= 20000) { o.w = w; o.h = hgt; }
+      if (priv) o.iv = String(a.iv || ''); else o.path = String(a.path || '');
+      return o;
+    }).filter(a => priv ? !!a.iv : new RegExp('^' + ANN_FILES + '/' + a.fileId + '_[^/\\\\]+$').test(a.path));
+  }
+  /** People mentioned in an announcement's text (only recipients, for a private one). */
+  Y.announcementMentions = (text, to) => cleanMentions(Y.findMentions({ kind: 'ann' }, text), to ? to.concat(me()) : null).filter(x => x !== me());
+  /** A picture from an announcement, as a Blob (decrypted in memory for a private one). */
+  Y.readAnnouncementFile = async function (a, att) {
+    if (!a.to) {
+      const f = await S.readFile(att.path);
+      if (!f) throw err('This picture is no longer on the shared drive.');
+      return f;
+    }
+    const k = annKeys.get(a.id);
+    if (!k) throw err('This picture can’t be opened here.');
+    const f = await S.readFile(`${ANN_FILES}/${att.fileId}.bin`);
+    if (!f) throw err('This picture is no longer on the shared drive.');
+    return new Blob([await C.decryptBytes(k, att.iv, await f.arrayBuffer(), 'annfile|' + a.id + '|' + att.fileId)], { type: att.type });
+  };
+  async function uploadAnnFiles(id, files, key) {
+    const out = [];
+    for (const f of files) {
+      const fileId = U.rand(8);
+      const base = { fileId, name: String(f.name || 'picture').slice(0, 200), size: f.size, type: String(f.type || '').slice(0, 100) };
+      if (typeof root.createImageBitmap === 'function') {
+        try { const bmp = await root.createImageBitmap(f); base.w = bmp.width; base.h = bmp.height; bmp.close(); } catch { /* not decodable here */ }
+      }
+      if (key) {
+        const enc = await C.encryptBytes(key, await f.arrayBuffer(), 'annfile|' + id + '|' + fileId);
+        await S.write(`${ANN_FILES}/${fileId}.bin`, enc.data);
+        out.push(Object.assign(base, { iv: enc.iv }));
+      } else {
+        const path = `${ANN_FILES}/${fileId}_${U.safeFileName(base.name)}`;
+        await S.write(path, f);
+        out.push(Object.assign(base, { path }));
+      }
+    }
+    return out;
+  }
+  const annFilePath = (a, att) => (a.to ? `${ANN_FILES}/${att.fileId}.bin` : att.path);
+
+  Y.postAnnouncement = async function ({ title, text, to, label, files }) {
     if (!A.can(Array.isArray(to) ? 'ann.private' : 'ann.post')) throw err(Array.isArray(to) ? 'You aren’t allowed to send private announcements.' : 'You aren’t allowed to post announcements to everyone.');
     if (Array.isArray(to)) {
       const t = Y.announceTeam();
@@ -1546,12 +1746,18 @@
     if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
     title = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
     text = String(text || '').trim();
-    if (!text) throw err('Write the announcement first.');
+    files = Array.from(files || []);
+    if (!text && !files.length) throw err('Write the announcement first.');
     if (text.length > Y.MAX_TEXT) throw err(`Announcements can be up to ${Y.MAX_TEXT} characters.`);
+    if (files.length > Y.MAX_ANN_FILES) throw err(`Attach at most ${Y.MAX_ANN_FILES} pictures.`);
+    const notPic = files.find(f => !isPic(f.type));
+    if (notPic) throw err(`“${notPic.name}” isn’t a picture. Announcements can have pictures only (PNG, JPG, GIF, WebP or BMP).`);
+    const big = files.find(f => f.size > Y.MAX_FILE);
+    if (big) throw err(`“${big.name}” is over the 5 MB limit.`);
     const ts = Date.now();
     const id = `${ts}_${me()}_${U.rand(4)}`;
     const raw = { v: 1, id, type: 'announcement', title, text, userId: me(), ts, kid: A.me.signFp };
-    let recipients = null;
+    let recipients = null, aes = null;
     if (Array.isArray(to)) {
       recipients = U.uniq(to.filter(x => x !== me() && !A.isRemoved(x)));
       if (!recipients.length) throw err('Pick at least one person to send it to.');
@@ -1568,13 +1774,19 @@
         const e = await C.encryptJSON(wk, { k: U.b64(key) }, 'annwrap|' + id + '|' + uid);
         raw.keys[uid] = { fp: u.ecdhFp, iv: e.iv, ct: e.ct };
       }
-      const aes = await C.importAes(key);
+      aes = await C.importAes(key);
       annKeys.set(id, aes);
-      raw.enc = await C.encryptJSON(aes, { title, text }, 'ann|' + id);
     }
+    const mentions = Y.announcementMentions(text, recipients);
+    const attachments = await uploadAnnFiles(id, files, aes);
+    if (aes) raw.enc = await C.encryptJSON(aes, { title, text, mentions, attachments }, 'ann|' + id);
+    else { raw.mentions = mentions; raw.attachments = attachments; }
     raw.sig = await C.sign(A.me.priv.sign, raw);
-    await S.writeJSON(`announcements/${id}.json`, raw);
-    Y.announcements.set(id, { id, userId: me(), ts, title, text, to: recipients, team: raw.team || null });
+    try { await S.writeJSON(`announcements/${id}.json`, raw); } catch (e) {
+      for (const a of attachments) S.remove(recipients ? `${ANN_FILES}/${a.fileId}.bin` : a.path).catch(() => {});
+      throw e;
+    }
+    Y.announcements.set(id, { id, userId: me(), ts, title, text, to: recipients, team: raw.team || null, mentions, attachments });
     annHint = Math.max(annHint, ts);
     noteMyPost(ANN_KEY, ts);
     Y.events.emit('announcements');
@@ -1589,6 +1801,7 @@
     if (!A.can('ann.withdraw') && !Y.canEditAnnouncement(a)) throw err('You aren’t allowed to withdraw announcements.');
     await S.remove(`announcements/${id}.json`);
     await S.remove(`announcements/edits/${id}.json`).catch(() => {});
+    for (const att of a.attachments || []) await S.remove(annFilePath(a, att)).catch(() => {});
     Y.announcements.delete(id);
     const ts = Date.now();
     annHint = Math.max(annHint, ts);
@@ -1626,7 +1839,7 @@
       if (ch.kind === 'public') pool = await collect(ch, since, signal);
       else await Y.ensureLoaded(ch, Infinity);
       for (const m of pool.msgs.values()) {
-        if (m.deleted || m.hidden || !m.verified || m.decryptError) continue;
+        if (m.deleted || m.hidden || !m.verified || m.decryptError || hiddenMsg(ch, m)) continue;
         if (userId && m.userId !== userId) continue;
         if (m.expires && m.expires < Date.now()) continue;
         const hay = (m.text + ' ' + m.attachments.map(a => a.name).join(' ')).toLowerCase();

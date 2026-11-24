@@ -32,6 +32,7 @@
       ['grp.accept', 'Accept group requests, move people', 'Decides which group’s messages someone sees.'],
       ['board.manage', 'Manage the project board', 'Create, assign, move, approve and receive projects.'],
       ['grp.rename', 'Rename the groups', 'The names of the two groups.'],
+      ['cal.manage', 'Manage the calendar', 'Add, change and delete events for everyone or their own group.'],
     ]],
     ['People and security', [
       ['log.view', 'See the activity log', 'Who renamed, hid, reset or removed what.'],

@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
   const SC = root.SC;
-  const U = SC.util, A = SC.account, Y = SC.sync, UI = SC.ui, C = SC.crypto, S = SC.store, N = SC.notify, B = SC.board, BV = SC.boardView;
+  const U = SC.util, A = SC.account, Y = SC.sync, UI = SC.ui, C = SC.crypto, S = SC.store, N = SC.notify, B = SC.board, BV = SC.boardView, K = SC.calendar, KV = SC.calendarView;
   const h = UI.h, icon = UI.icon;
   /** @namespace SC.chat */
   const Chat = {};
@@ -109,6 +109,7 @@
     el.msgs.addEventListener('focusin', placeTools);
     el.msgs.addEventListener('scroll', onScroll, { passive: true });
     el.side.addEventListener('click', onSideClick);
+    el.side.addEventListener('contextmenu', onSideContext);
     setupDrop();
 
     unsub = [
@@ -126,6 +127,8 @@
       B.events.on('change', () => { schedule('side'); if (isBoard()) { if (leaveHiddenBoard()) return; schedule('msgs', 'head'); } }),
       B.events.on('open', it => BV.notificationsDialog(it && it.type === 'completed' ? { tab: 'history', pid: it.pid } : {})),
       Y.events.on('incoming', onIncoming),
+      Y.events.on('prefs', () => schedule('side', 'head', 'composer', 'msgs')),
+      K.events.on('change', () => schedule('side')),
       Y.events.on('inbox', () => schedule('side')),
       Y.events.on('announcements', () => { schedule('side'); if (isAnn()) schedule('msgs'); showPendingAnnouncement(); }),
       A.events.on('workspace', () => { noteRoleChange(); leaveHiddenBoard(); schedule('side', 'head', 'composer', 'msgs', 'banners'); if (A.isRemoved(meId())) SC.app.lock('Your account was removed by the admin.'); else askTeamIfNeeded(); }),
@@ -160,6 +163,7 @@
     localUrls.clear();
     thumbLoading.clear();
     Array.from(viewers).forEach(close => close());
+    KV.close();
     st.unmounting = true; // closing an announcement pop-up here (sign-out) shouldn't count as reading it
     try { UI.closeAll(); } finally { st.unmounting = false; }
     el = {};
@@ -214,14 +218,20 @@
     // channels: public ones plus the private channels I've been invited to
     const pub = all.filter(c => (c.kind === 'public' && !Y.info(c).archived) || (Y.isPrivateChannel(c) && c.groupName)).sort((a, b) => Y.info(a).name.localeCompare(Y.info(b).name));
     const groups = all.filter(c => c.kind === 'group' && c.groupName && !Y.isPrivateChannel(c)).sort((a, b) => Y.info(a).name.localeCompare(Y.info(b).name));
-    const dms = all.filter(c => c.kind === 'dm' || (c.kind === 'group' && !c.groupName && !Y.isPrivateChannel(c))).sort((a, b) => Y.info(a).name.localeCompare(Y.info(b).name));
+    // direct messages (and unnamed group messages): pinned first, archived ones in their own fold, deleted ones gone until a new message
+    const byName = (a, b) => Y.info(a).name.localeCompare(Y.info(b).name);
+    const dmAll = all.filter(c => (c.kind === 'dm' || (c.kind === 'group' && !c.groupName && !Y.isPrivateChannel(c))) && (!Y.isChatDeleted(c) || c.id === st.openId));
+    const dms = dmAll.filter(c => !Y.isArchived(c.id)).sort((a, b) => (Y.isChatPinned(b.id) ? 1 : 0) - (Y.isChatPinned(a.id) ? 1 : 0) || byName(a, b));
+    const archived = dmAll.filter(c => Y.isArchived(c.id)).sort(byName);
+    const archUnread = archived.reduce((n, c) => n + (c.id === st.openId ? 0 : c.unread), 0);
     const me = A.users.get(meId());
     const myP = Y.presenceOf(meId());
 
-    const item = ch => {
+    const item = (ch, dmList) => {
       const info = Y.info(ch);
       const active = ch.id === st.openId;
       const muted = Y.isMuted(ch.id);
+      const blocked = ch.kind === 'dm' && Y.isBlocked(Y.dmOther(ch));
       let lead;
       if (ch.kind === 'public') lead = h('span', { class: 'hash', 'aria-hidden': 'true' }, '#');
       else if (ch.kind === 'dm') lead = UI.dot(Y.presenceOf(Y.dmOther(ch)).state);
@@ -234,8 +244,12 @@
       return h('button', {
         class: 'side-item' + (active ? ' active' : '') + (ch.unread && !active ? ' unread' : '') + (muted ? ' muted-ch' : ''),
         'data-open': ch.id, 'data-key': 'ch:' + ch.id, 'aria-current': active ? 'page' : null, 'aria-label': label,
-      }, lead, h('span', { class: 'lbl' }, info.name), muted ? icon('bellOff') : null, badge);
+      }, lead, h('span', { class: 'lbl' }, info.name), blocked ? icon('block', 'side-flag') : null, dmList && Y.isChatPinned(ch.id) ? icon('pin', 'side-flag') : null, muted ? icon('bellOff') : null, badge);
     };
+    // a direct message row also has a ⋯ menu: pin, mute, archive, delete, block
+    const dmRow = ch => h('div', { class: 'side-row' }, item(ch, true),
+      h('button', { class: 'icon-btn side-more', 'data-act': 'chat-menu', 'data-chat': ch.id, 'data-key': 'more:' + ch.id, 'aria-label': 'More options for ' + Y.info(ch).name, title: 'Pin, mute, archive, delete or block' }, icon('more')));
+    const calCount = K.unreadCount(), calToday = K.todayCount();
     const inboxCount = A.isOwner() ? A.inboxUnread() : 0;
     const notifCount = N.unreadCount();
     const boardCount = B.unreadCount();
@@ -274,7 +288,11 @@
           icon(quiet ? 'bellOff' : 'bell'), notifCount ? h('span', { class: 'badge red bell-badge' }, notifCount > 99 ? '99+' : String(notifCount)) : null),
           h('button', { class: 'icon-btn bell-btn board-bell' + (boardCount ? ' has' : ''), 'data-act': 'board-notifications', 'data-key': 'boardbell',
             'aria-label': 'Board notifications' + (boardCount ? `, ${boardCount} unread` : ''), title: 'Board notifications (projects)' },
-          icon('boardBell'), boardCount ? h('span', { class: 'badge red bell-badge' }, boardCount > 99 ? '99+' : String(boardCount)) : null)),
+          icon('boardBell'), boardCount ? h('span', { class: 'badge red bell-badge' }, boardCount > 99 ? '99+' : String(boardCount)) : null),
+          h('button', { class: 'icon-btn bell-btn cal-btn' + (calCount ? ' has' : ''), 'data-act': 'calendar', 'data-key': 'cal',
+            'aria-label': 'Calendar' + (calCount ? `, ${calCount} new ${calCount === 1 ? 'event' : 'events'}` : '') + (calToday ? `, ${calToday} today` : ''),
+            title: 'Calendar' + (calToday ? ` · ${calToday} ${calToday === 1 ? 'event' : 'events'} today` : '') },
+          icon('calendar'), calCount ? h('span', { class: 'badge red bell-badge' }, calCount > 99 ? '99+' : String(calCount)) : calToday ? h('span', { class: 'cal-today-dot', 'aria-hidden': 'true' }) : null)),
         h('div', { class: 'conn' }, UI.dot(Y.connected ? 'online' : 'offline'), Y.connected ? 'Shared drive connected' : 'Not connected to the shared drive')),
       h('button', { class: 'jump', 'data-act': 'jump', 'data-key': 'jump' }, icon('search'), 'Search or jump to…', h('kbd', null, 'Ctrl K')),
       h('nav', { class: 'side-scroll' },
@@ -290,13 +308,18 @@
         h('div', { class: 'side-sec' }, h('span', null, 'Project boards')),
         boardRows.length ? boardRows : h('div', { class: 'side-empty' }, 'Your board appears once an admin accepts your group'),
         h('div', { class: 'side-sec' }, h('span', null, 'Channels'), A.canAny('ch.create', 'ch.createPrivate') ? h('button', { class: 'icon-btn', 'data-act': 'new-channel', 'data-key': 'newch', 'aria-label': 'Create a channel', title: 'Create a channel' }, icon('plus')) : null),
-        pub.map(item),
+        pub.map(c => item(c)),
         h('div', { class: 'side-sec' }, h('span', null, 'Group chats'), h('span', { class: 'row', style: { gap: '0' } },
           h('button', { class: 'icon-btn', 'data-act': 'browse-groups', 'data-key': 'browse', 'aria-label': 'Browse groups you can ask to join', title: 'Browse groups' }, icon('search')),
           h('button', { class: 'icon-btn', 'data-act': 'new-group', 'data-key': 'newgrp', 'aria-label': 'Create a group chat', title: 'Create a group chat' }, icon('plus')))),
-        groups.length ? groups.map(item) : h('div', { class: 'side-empty' }, 'No group chats yet'),
+        groups.length ? groups.map(c => item(c)) : h('div', { class: 'side-empty' }, 'No group chats yet'),
         h('div', { class: 'side-sec' }, h('span', null, 'Direct messages'), h('button', { class: 'icon-btn', 'data-act': 'new-dm', 'data-key': 'newdm', 'aria-label': 'New direct message', title: 'New direct message' }, icon('plus'))),
-        dms.length ? dms.map(item) : h('div', { class: 'side-empty' }, 'No conversations yet')),
+        dms.length ? dms.map(dmRow) : h('div', { class: 'side-empty' }, archived.length ? 'No other conversations' : 'No conversations yet'),
+        archived.length ? h('button', { class: 'side-item side-arch' + (archUnread ? ' unread' : ''), 'data-act': 'toggle-archived', 'data-key': 'arch', 'aria-expanded': String(!!st.showArchived),
+          'aria-label': `Archived conversations, ${archived.length}` + (archUnread ? `, ${archUnread} unread` : '') },
+        icon('archive'), h('span', { class: 'lbl' }, `Archived (${archived.length})`), archUnread ? h('span', { class: 'badge' }, String(archUnread)) : null,
+        h('span', { class: 'side-caret' + (st.showArchived ? ' open' : '') }, '›')) : null,
+        archived.length && st.showArchived ? archived.map(dmRow) : null),
       h('div', { class: 'side-tools' },
         A.isOwner() ? null : h('button', { class: 'side-item', 'data-act': 'feedback', 'data-key': 'fb' }, icon('megaphone'), h('span', { class: 'lbl' }, 'Send feedback')),
         A.isOwner() ? h('button', { class: 'side-item' + (inboxCount ? ' unread' : ''), 'data-act': 'inbox', 'data-key': 'inbox' }, icon('inbox'), h('span', { class: 'lbl' }, 'Feedback inbox'), inboxCount ? h('span', { class: 'badge red' }, String(inboxCount)) : null) : null),
@@ -306,7 +329,7 @@
           h('div', { class: 'st' }, UI.dot(myP.state), myP.statusText || UI.stateLabel(myP.state))),
         h('button', { class: 'icon-btn', 'data-act': 'me-menu', 'data-key': 'me', 'aria-label': 'Profile and settings', title: 'Profile and settings' }, icon('settings'))));
     if (focusKey) { const f = el.side.querySelector(`[data-key="${CSS.escape(focusKey)}"]`); if (f) f.focus(); }
-    const n = Y.totalUnread() + notifCount + boardCount;
+    const n = Y.totalUnread() + notifCount + boardCount + calCount;
     document.title = (n ? `(${n}) ` : '') + A.ws.name;
   }
 
@@ -322,10 +345,54 @@
       case 'browse-groups': return browseGroupsDialog();
       case 'notifications': return notificationsDialog();
       case 'board-notifications': return BV.notificationsDialog();
+      case 'calendar': return KV.open();
+      case 'chat-menu': { const ch = Y.chans.get(t.dataset.chat); return ch ? chatMenu(ch, t) : null; }
+      case 'toggle-archived': st.showArchived = !st.showArchived; return renderSidebar();
       case 'feedback': return feedbackDialog();
       case 'inbox': return A.isOwner() ? inboxDialog() : null;
       case 'me-menu': return profileMenu(t);
     }
+  }
+
+  /** Right-click a direct message in the sidebar: the same menu as its ⋯ button. */
+  function onSideContext(e) {
+    const t = e.target.closest('[data-open]');
+    const ch = t && Y.chans.get(t.dataset.open);
+    if (!ch || !t.closest('.side-row')) return;
+    e.preventDefault();
+    chatMenu(ch, t);
+  }
+
+  /* ---- direct message options (1.15): pin, mute, archive, delete, block ----
+   * Kept in my own encrypted settings file (js/sync.js), so they follow me to other PCs and only I know. */
+  const keep = (p, msg) => Promise.resolve(p).then(() => { if (msg) UI.toast(msg, 'ok'); }).catch(e => UI.toast(e.message, 'error'));
+  function chatMenu(ch, anchor) {
+    const name = Y.info(ch).name;
+    const other = ch.kind === 'dm' ? Y.dmOther(ch) : null;
+    const pinned = Y.isChatPinned(ch.id), muted = Y.isMuted(ch.id), arch = Y.isArchived(ch.id), blocked = !!other && Y.isBlocked(other);
+    const row = (ic, label, fn, danger) => h('button', { class: 'menu-item' + (danger ? ' danger' : ''), onclick: () => { UI.closePopover(); fn(); } }, icon(ic), label);
+    UI.popover(anchor, [
+      h('div', { class: 'menu-label' }, name),
+      row('pin', pinned ? 'Unpin' : 'Pin to the top', () => keep(Y.setChatPinned(ch.id, !pinned), pinned ? 'Unpinned' : 'Pinned to the top')),
+      row(muted ? 'bell' : 'bellOff', muted ? 'Unmute' : 'Mute notifications', () => keep(Y.setMuted(ch.id, !muted), muted ? 'Notifications on' : 'Muted. Unread counts still show.')),
+      row('archive', arch ? 'Unarchive' : 'Archive', () => keep(Y.setArchived(ch.id, !arch), arch ? 'Moved back to Direct messages' : 'Archived. Find it under Archived at the bottom of Direct messages.')),
+      h('div', { class: 'menu-sep', role: 'separator' }),
+      row('trash', 'Delete chat', () => deleteChat(ch), true),
+      other && A.users.get(other) ? row('block', blocked ? `Unblock ${A.name(other)}` : `Block ${A.name(other)}`, () => blockUser(other, !blocked), !blocked) : null,
+    ], { label: 'Options for ' + name, placement: 'right-up' });
+  }
+  async function deleteChat(ch) {
+    const other = ch.kind === 'dm' ? A.name(Y.dmOther(ch)) : 'The others';
+    if (!(await UI.confirm({ title: `Delete your chat with ${Y.info(ch).name}?`, ok: 'Delete chat', danger: true,
+      text: `The messages disappear for you only, on every PC you use. ${other} still ${ch.kind === 'dm' ? 'has' : 'have'} them until they’re deleted from the shared drive after 7 days. If a new message comes, the chat comes back with just that.` }))) return;
+    await keep(Y.deleteChat(ch), 'Chat deleted');
+    if (st.openId === ch.id) { UI.closeAll(); Chat.open(Y.chans.has('general') ? 'general' : Array.from(Y.chans.keys()).find(id => id !== ch.id)); }
+  }
+  async function blockUser(uid, on) {
+    const nm = A.name(uid);
+    if (on && !(await UI.confirm({ title: `Block ${nm}?`, ok: 'Block', danger: true,
+      text: `${nm} isn’t told. Their direct messages to you are hidden and don’t notify you, and you can’t message them until you unblock. Messages they send while blocked stay hidden even after you unblock. You still see what they write in channels and groups.` }))) return;
+    await keep(Y.setBlocked(uid, on), on ? `${nm} is blocked` : `${nm} is unblocked`);
   }
 
   /* ================= header & banners ================= */
@@ -392,7 +459,8 @@
       const other = A.users.get(Y.dmOther(ch));
       const p = Y.presenceOf(Y.dmOther(ch));
       UI.set(el.head, menuBtn, UI.avatar(other, 34),
-        h('div', { class: 'two' }, h('div', { class: 'title' }, h('span', { class: 'nm' }, info.name)),
+        h('div', { class: 'two' }, h('div', { class: 'title' }, h('span', { class: 'nm' }, info.name),
+          Y.isBlocked(Y.dmOther(ch)) ? h('span', { class: 'pill grey' }, icon('block'), 'Blocked') : null, Y.isMuted(ch.id) ? icon('bellOff') : null),
           h('div', { class: 'sub' }, UI.dot(p.state), UI.stateLabel(p.state) + (p.statusText ? ' · ' + p.statusText : ''))),
         h('div', { class: 'tools' }, badges, searchBtn, infoBtn));
     } else {
@@ -822,25 +890,39 @@
     maybeMarkRead();
   }
 
-  async function loadThumbs(ch) {
-    const nodes = Array.from(el.msgs.querySelectorAll('[data-thumb]')).filter(n => !thumbLoading.has(n.dataset.thumb));
+  /** Load the pictures still showing a placeholder inside `box`. find(node) → {a, read()} for the picture. */
+  async function loadPics(box, find) {
+    const nodes = Array.from(box.querySelectorAll('[data-thumb]')).filter(n => !thumbLoading.has(n.dataset.thumb));
     await U.mapLimit(nodes, 3, async node => {
       const fileId = node.dataset.thumb;
-      const row = node.closest('.msg');
-      const m = row && ch.msgs.get(row.dataset.id);
-      const a = m && m.attachments[Number(node.dataset.i)];
-      if (!a) return;
+      const it = find(node);
+      if (!it || !it.a) return;
       thumbLoading.add(fileId);
       try {
-        const blob = await Y.readAttachment(ch, m, a);
-        const url = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(await it.read());
         blobUrls.set(fileId, url);
-        document.querySelectorAll(`[data-thumb="${fileId}"]`).forEach(n => { n.removeAttribute('data-thumb'); n.classList.remove('loading'); if (n.parentElement) n.parentElement.classList.remove('loading'); UI.set(n, thumbImg(url, a)); });
+        document.querySelectorAll(`[data-thumb="${fileId}"]`).forEach(n => { n.removeAttribute('data-thumb'); n.classList.remove('loading'); if (n.parentElement) n.parentElement.classList.remove('loading'); UI.set(n, thumbImg(url, it.a)); });
       } catch (e) {
-        imageFailed(node, a);
+        imageFailed(node, it.a);
       }
     });
   }
+  function loadThumbs(ch) {
+    return loadPics(el.msgs, node => {
+      const row = node.closest('.msg');
+      const m = row && ch.msgs.get(row.dataset.id);
+      const a = m && m.attachments[Number(node.dataset.i)];
+      return a ? { a, read: () => Y.readAttachment(ch, m, a) } : null;
+    });
+  }
+  /** Pictures in announcements (1.15): in the feed and in the pop-up. */
+  function annPic(node) {
+    const row = node.closest('[data-ann]');
+    const a = row && Y.announcements.get(row.dataset.ann);
+    const att = a && (a.attachments || [])[Number(node.dataset.i)];
+    return att ? { a: att, read: () => Y.readAnnouncementFile(a, att) } : null;
+  }
+  const loadAnnPics = box => loadPics(box, annPic);
 
   /** Display size for an image: whole picture, at most 360×280, never upscaled. */
   function fitImage(a) {
@@ -954,27 +1036,7 @@
     try {
       if (isImage(a) && !saveOnly) {
         const pics = m.attachments.filter(isImage);
-        const items = pics.map(p => {
-          let pending = null; // one read per picture, shared by the pre-load and the click
-          return {
-            a: p,
-            load: () => {
-              const have = blobUrls.get(p.fileId);
-              if (have) return Promise.resolve(have);
-              if (!pending) {
-                pending = Y.readAttachment(ch, m, p).then(blob => {
-                  const url = URL.createObjectURL(blob);
-                  blobUrls.set(p.fileId, url);
-                  return url;
-                }).catch(e => { pending = null; throw e; });
-              }
-              return pending;
-            },
-            getBlob: () => Y.readAttachment(ch, m, p),
-          };
-        });
-        await items[pics.indexOf(a)].load();
-        return lightbox(items, pics.indexOf(a));
+        return openPictures(pics, pics.indexOf(a), p => Y.readAttachment(ch, m, p));
       }
       if (isPdf(a) && !saveOnly) {
         const blob = await Y.readAttachment(ch, m, a);
@@ -982,6 +1044,37 @@
       }
       await saveAs(a.name, () => Y.readAttachment(ch, m, a));
     } catch (e) { UI.toast(e.message, 'error'); }
+  }
+
+  /** Open pictures in the viewer, starting at `start`. read(p) → Blob. */
+  async function openPictures(pics, start, read) {
+    const items = pics.map(p => {
+      let pending = null; // one read per picture, shared by the pre-load and the click
+      return {
+        a: p,
+        load: () => {
+          const have = blobUrls.get(p.fileId);
+          if (have) return Promise.resolve(have);
+          if (!pending) {
+            pending = read(p).then(blob => {
+              const url = URL.createObjectURL(blob);
+              blobUrls.set(p.fileId, url);
+              return url;
+            }).catch(e => { pending = null; throw e; });
+          }
+          return pending;
+        },
+        getBlob: () => read(p),
+      };
+    });
+    await items[start].load();
+    return lightbox(items, start);
+  }
+  function openAnnPicture(a, i, saveOnly) {
+    const att = a && (a.attachments || [])[i];
+    if (!att) return;
+    const read = p => Y.readAnnouncementFile(a, p);
+    (saveOnly ? saveAs(att.name, () => read(att)) : openPictures(a.attachments, i, read)).catch(e => UI.toast(e.message, 'error'));
   }
 
   /** Full-screen image viewer: mouse wheel, +/− buttons or keys, or double-click to zoom; drag to move around.
@@ -1143,6 +1236,13 @@
       UI.set(el.composerWrap, h('div', { class: 'archived-note' }, 'This channel is archived. You can read it, but not post.'));
       return;
     }
+    if (ch.kind === 'dm' && Y.isBlocked(Y.dmOther(ch))) {
+      el.ta = null;
+      const other = Y.dmOther(ch);
+      UI.set(el.composerWrap, h('div', { class: 'archived-note' }, `You blocked ${A.name(other)}. They can’t reach you here and you can’t send them messages. `,
+        h('button', { class: 'link-btn', onclick: () => blockUser(other, false) }, 'Unblock')));
+      return;
+    }
     const placeholder = 'Message ' + chName(ch);
     const ta = h('textarea', { rows: '1', placeholder, 'aria-label': placeholder });
     ta.value = st.drafts[ch.id] || '';
@@ -1166,7 +1266,7 @@
       h('div', { class: 'comp-hint' }, el.hintLeft, el.count));
     ta.addEventListener('input', () => { st.drafts[ch.id] = ta.value; autosize(ta); updateCount(); mentionCheck(); });
     ta.addEventListener('keydown', onComposerKey);
-    ta.addEventListener('click', mentionCheck);
+    ta.addEventListener('click', () => mentionCheck());
     ta.addEventListener('paste', e => {
       const files = Array.from(e.clipboardData ? e.clipboardData.files : []);
       if (files.length) { e.preventDefault(); addFiles(files); }
@@ -1287,30 +1387,54 @@
     if (e.key === 'Escape' && st.replies[st.openId]) { e.preventDefault(); e.stopPropagation(); st.replies[st.openId] = null; renderReplyBar(); }
   }
 
-  /* ---- @mention picker ---- */
-  let mention = null; // {start, items, sel, el}
-  function mentionCheck() {
-    const ta = el.ta;
-    if (!ta) return;
+  /* ---- @mention picker ----
+   * Works on any textarea: the message box, and the announcement dialogs (1.15).
+   * ctx = {ta, users() → who can be mentioned, channel: offer @channel, place(el) → put the list on screen} */
+  let mention = null; // {ctx, start, items, sel, el}
+  function composerCtx() {
+    const ch = cur();
+    if (!el.ta || !ch) return null;
+    const mem = ch.kind !== 'public' ? Y.members(ch) : null;
+    return { ta: el.ta, channel: ch.kind === 'public', users: () => A.activeUsers().filter(u => !mem || mem.includes(u.id)),
+      place: box => { Object.assign(box.style, { position: 'absolute', bottom: 'calc(100% - 4px)', left: '20px' }); el.composerWrap.appendChild(box); } };
+  }
+  function mentionCheck(ctx) {
+    ctx = ctx || composerCtx();
+    if (!ctx) return;
+    const ta = ctx.ta;
     const before = ta.value.slice(0, ta.selectionStart);
     const m = /(^|\s)@([\p{L}\p{N}._'\- ]{0,32})$/u.exec(before);
     if (!m) return closeMention();
     const q = m[2].toLowerCase();
-    const ch = cur();
-    let items = A.activeUsers().filter(u => u.id !== meId() && u.name.toLowerCase().startsWith(q))
-      .concat(q.length > 1 ? A.activeUsers().filter(u => u.id !== meId() && !u.name.toLowerCase().startsWith(q) && u.name.toLowerCase().includes(q)) : []);
-    if (ch.kind !== 'public') { const mem = Y.members(ch); items = items.filter(u => mem.includes(u.id)); }
+    const pool = ctx.users().filter(u => u.id !== meId());
+    let items = pool.filter(u => u.name.toLowerCase().startsWith(q))
+      .concat(q.length > 1 ? pool.filter(u => !u.name.toLowerCase().startsWith(q) && u.name.toLowerCase().includes(q)) : []);
     items = items.slice(0, 8).map(u => ({ id: u.id, name: u.name, user: u }));
-    if (ch.kind === 'public' && 'channel'.startsWith(q)) items.push({ id: 'channel', name: 'channel' });
+    if (ctx.channel && 'channel'.startsWith(q)) items.push({ id: 'channel', name: 'channel' });
     if (!items.length || (q.includes(' ') && !items.some(i => i.name.toLowerCase().startsWith(q)))) return closeMention();
     const start = before.length - m[2].length - 1;
+    if (mention && mention.ctx.ta !== ta) closeMention();
     const sel = mention ? Math.min(mention.sel, items.length - 1) : 0;
     if (!mention) {
-      mention = { el: h('div', { class: 'popover mention-pop', role: 'listbox', 'aria-label': 'Mention someone', style: { position: 'absolute', bottom: 'calc(100% - 4px)', left: '20px' } }) };
-      el.composerWrap.appendChild(mention.el);
+      mention = { ctx, el: h('div', { class: 'popover mention-pop', role: 'listbox', 'aria-label': 'Mention someone' }) };
+      ctx.place(mention.el);
     }
     Object.assign(mention, { start, items, sel });
     drawMention();
+  }
+  /** @mentions in a dialog's textarea: the list opens just under it. */
+  function mentionField(ta, users) {
+    const ctx = { ta, users, channel: false, place: box => {
+      document.body.appendChild(box);
+      const r = ta.getBoundingClientRect();
+      const below = r.bottom + 4 + 280 < window.innerHeight;
+      Object.assign(box.style, { position: 'fixed', left: Math.max(8, Math.min(r.left, window.innerWidth - 310)) + 'px', top: below ? (r.bottom + 4) + 'px' : 'auto', bottom: below ? 'auto' : (window.innerHeight - r.top + 4) + 'px' });
+    } };
+    ta.addEventListener('input', () => mentionCheck(ctx));
+    ta.addEventListener('click', () => mentionCheck(ctx));
+    ta.addEventListener('keydown', e => { if (mention && mention.ctx === ctx && mentionKey(e)) e.stopPropagation(); });
+    ta.addEventListener('blur', () => setTimeout(() => { if (mention && mention.ctx === ctx) closeMention(); }, 150));
+    return ctx;
   }
   function drawMention() {
     UI.set(mention.el, ...mention.items.map((it, i) => h('button', {
@@ -1332,7 +1456,7 @@
   }
   function pickMention(i) {
     const it = mention.items[i];
-    const ta = el.ta;
+    const ta = mention.ctx.ta;
     ta.setRangeText('@' + it.name + ' ', mention.start, ta.selectionStart, 'end');
     closeMention();
     ta.focus();
@@ -1345,12 +1469,13 @@
   function onIncoming({ ch, msgs }) {
     if (Y.isMuted(ch.id)) return;
     const viewing = ch.id === st.openId && document.visibilityState === 'visible' && document.hasFocus();
+    // Notification settings (1.15): direct messages, group chats (and private channels), public channels; mentions have their own switch
+    const kind = ch.kind === 'dm' ? 'dms' : ch.kind === 'group' ? 'groupMsgs' : 'channels';
     for (const m of msgs) {
       if (m.deleted || !m.verified) continue;
       const mentioned = m.mentions.includes(meId()) || m.mentions.includes('channel');
-      if (ch.kind === 'public' && !mentioned) continue;
       if (viewing) continue;
-      if (mentioned && !N.allow('mentions')) continue;
+      if (mentioned ? !N.allow('mentions') : !N.allow(kind)) continue;
       const who = A.name(m.userId);
       const title = ch.kind === 'dm' ? who : `${who} in ${chName(ch)}`;
       const body = m.decryptError ? 'New message' : (m.text ? (m.poll ? '📊 Poll: ' : '') + m.text.replace(/\s+/g, ' ').slice(0, 140) : '📎 Sent an attachment');
@@ -1584,7 +1709,7 @@
     const info = Y.info(ch);
     const muted = Y.isMuted(ch.id);
     const body = [];
-    const muteBtn = h('button', { class: 'btn', onclick: () => { Y.setMuted(ch.id, !muted); m.close(); renderHeader(); } }, icon(muted ? 'bell' : 'bellOff'), muted ? 'Unmute notifications' : 'Mute notifications');
+    const muteBtn = h('button', { class: 'btn', onclick: () => { keep(Y.setMuted(ch.id, !muted)); m.close(); renderHeader(); } }, icon(muted ? 'bell' : 'bellOff'), muted ? 'Unmute notifications' : 'Mute notifications');
     if (ch.kind === 'public') {
       body.push(h('dl', { class: 'kv' },
         h('dt', null, 'Name'), h('dd', null, '#' + info.name),
@@ -1686,6 +1811,16 @@
           UI.toast(`You left ${chName(ch)}`, 'ok');
         } catch (e) { UI.toast(e.message, 'error'); }
       } }, icon('userX'), Y.isPrivateChannel(ch) ? 'Leave channel' : 'Leave group') : null;
+      // direct messages (and unnamed group messages): the same options as the ⋯ menu in the sidebar
+      if (ch.kind === 'dm' || (ch.kind === 'group' && !ch.groupName && !pc)) {
+        const pinned = Y.isChatPinned(ch.id), arch = Y.isArchived(ch.id);
+        const other = ch.kind === 'dm' ? others[0] : null, blocked = !!other && Y.isBlocked(other);
+        body.push(h('div', { class: 'row', style: { flexWrap: 'wrap', marginBottom: '10px' } },
+          h('button', { class: 'btn', onclick: () => { keep(Y.setChatPinned(ch.id, !pinned), pinned ? 'Unpinned' : 'Pinned to the top'); m.close(); } }, icon('pin'), pinned ? 'Unpin' : 'Pin to the top'),
+          h('button', { class: 'btn', onclick: () => { keep(Y.setArchived(ch.id, !arch), arch ? 'Moved back to Direct messages' : 'Archived'); m.close(); } }, icon('archive'), arch ? 'Unarchive' : 'Archive'),
+          h('button', { class: 'btn', onclick: () => { m.close(); deleteChat(ch); } }, icon('trash'), 'Delete chat'),
+          other && A.users.get(other) ? h('button', { class: 'btn' + (blocked ? '' : ' btn-danger'), onclick: () => { m.close(); blockUser(other, !blocked); } }, icon('block'), blocked ? 'Unblock' : 'Block') : null));
+      }
       body.push(h('div', { class: 'row' }, muteBtn, leaveBtn));
     }
     const m = UI.modal({ title: ch.kind === 'public' ? '#' + info.name : info.name, cls: 'mid', body });
@@ -1975,7 +2110,6 @@
     const admin = canAnnounce();
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
     const keepTop = box.scrollTop;
-    const openReach = new Set(Array.from(box.querySelectorAll('details[open]')).map(d => d.closest('[data-ann]')).filter(Boolean).map(r => r.dataset.ann));
     if (!st.annFresh) st.annFresh = new Set();
     feedPending(annFeed()).forEach(a => st.annFresh.add(a.id)); // keep "new" highlighted after it's marked seen
     const feed = annFeed();
@@ -1993,15 +2127,9 @@
       if (fresh && !divDone) { frag.appendChild(h('div', { class: 'new-div', role: 'separator' }, 'New')); divDone = true; }
       const u = A.users.get(a.userId);
       const role = A.roleLabel(a.userId);
-      let reach = null;
-      if (admin) {
-        const r = Y.announcementReach(a);
-        const missing = r.audience.filter(x => !r.seen.includes(x));
-        reach = h('details', { class: 'ann-reach', open: openReach.has(a.id) },
-          h('summary', null, `Seen by ${r.seen.length} of ${r.audience.length}`),
-          h('div', { class: 'muted', style: { fontSize: '13px', marginTop: '4px' } }, missing.length ? 'Not seen yet: ' + missing.map(x => x.name).sort().join(', ') : 'Everyone has seen it.'));
-      }
-      frag.appendChild(h('div', { class: 'msg theirs ann-msg' + (fresh ? ' ann-new' : ''), 'data-ann': a.id, tabindex: admin ? '0' : null },
+      const reach = admin ? seenRow(a) : null;
+      const forMe = (a.mentions || []).includes(meId());
+      frag.appendChild(h('div', { class: 'msg theirs ann-msg' + (fresh ? ' ann-new' : '') + (forMe ? ' ann-mentioned' : ''), 'data-ann': a.id, tabindex: admin ? '0' : null },
         h('div', { class: 'msg-gutter' }, h('button', { class: 'avatar-btn', 'data-action': 'profile', 'aria-label': `${A.name(a.userId)}: view profile`, title: 'View profile' }, UI.avatar(u, 40))),
         h('div', { class: 'msg-main' },
           h('div', { class: 'msg-head' }, h('button', { class: 'msg-name', 'data-action': 'profile' }, A.name(a.userId)),
@@ -2011,7 +2139,8 @@
             a.editTs ? h('span', { class: 'msg-time', title: 'Edited ' + U.formatFull(a.editTs) }, '(edited)') : null),
           h('div', { class: 'ann-card' },
             a.title ? h('div', { class: 'ann-title' }, a.title) : null,
-            h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, []) }),
+            a.text ? h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, a.mentions || []) }) : null,
+            a.attachments && a.attachments.length ? h('div', { class: 'ann-pics' }, renderAttachments({ attachments: a.attachments })) : null,
             reach,
             // shown on hover (and keyboard focus) at the card's corner, like the tools on chat messages
             admin ? h('div', { class: 'msg-tools ann-tools', role: 'toolbar', 'aria-label': 'Announcement actions' },
@@ -2024,7 +2153,42 @@
       if (d) d.scrollIntoView({ block: 'start' }); else box.scrollTop = box.scrollHeight;
       st.firstRender = false;
     } else box.scrollTop = keepTop;
+    loadAnnPics(box);
     ackVisibleAnnouncements();
+  }
+
+  /* ---- who has seen an announcement (admins) ----
+   * The faces of the last five people who saw it; "See more" opens the whole list, with who hasn't seen it yet. */
+  const SEEN_FACES = 5;
+  function seenRow(a) {
+    const r = Y.announcementReach(a);
+    const faces = r.seen.slice(0, SEEN_FACES);
+    const missing = r.audience.length - r.seen.length;
+    return h('div', { class: 'ann-seen' },
+      h('span', { class: 'ann-seen-n' }, icon('check'), r.audience.length && !missing ? `Seen by everyone (${r.seen.length})` : `Seen by ${r.seen.length} of ${r.audience.length}`),
+      faces.length ? h('span', { class: 'ann-faces', role: 'img', 'aria-label': 'Seen by ' + faces.map(u => u.name).join(', ') + (r.seen.length > faces.length ? ` and ${r.seen.length - faces.length} more` : '') },
+        faces.map(u => h('span', { class: 'ann-face', title: `${u.name} · seen ${U.formatDateTime(r.ackAt(u))}` }, UI.avatar(u, 24)))) : null,
+      r.seen.length > SEEN_FACES ? h('button', { class: 'link-btn ann-seen-more', 'data-action': 'ann-seen' }, `See more (+${r.seen.length - SEEN_FACES})`)
+        : missing ? h('button', { class: 'link-btn ann-seen-more', 'data-action': 'ann-seen' }, `${missing} not yet`) : null);
+  }
+  function seenDialog(a) {
+    if (!a) return;
+    let tab = 'seen';
+    const tabs = h('div', { class: 'tabs', role: 'tablist' });
+    const list = h('div', { class: 'people-list seen-list' });
+    function draw() {
+      const r = Y.announcementReach(a);
+      const notYet = r.audience.filter(u => !r.seen.includes(u)).sort((x, y) => x.name.localeCompare(y.name));
+      UI.set(tabs, [['seen', `Seen (${r.seen.length})`], ['not', `Not seen yet (${notYet.length})`]].map(([id, label]) =>
+        h('button', { role: 'tab', 'aria-selected': String(tab === id), onclick: () => { tab = id; draw(); } }, label)));
+      const people = tab === 'seen' ? r.seen : notYet;
+      UI.set(list, people.length ? people.map(u => h('div', { class: 'person', onclick: () => profileDialog(u.id) }, UI.avatar(u, 32),
+        h('div', { style: { flex: 1, minWidth: 0 } }, h('div', { class: 'nm' }, u.name), h('div', { class: 'sub' }, tab === 'seen' ? 'Seen ' + U.formatDateTime(r.ackAt(u)) : (A.teamOf(u.id) ? A.teamName(A.teamOf(u.id)) : 'No group yet')))))
+        : h('div', { class: 'muted', style: { padding: '10px' } }, tab === 'seen' ? 'Nobody has seen it yet.' : 'Everyone has seen it.'));
+    }
+    const unsub = Y.events.on('presence', changed => { if (changed) draw(); });
+    UI.modal({ title: a.title ? `Seen: ${a.title}` : 'Who has seen it', cls: 'mid', body: [tabs, list], onClose: unsub });
+    draw();
   }
 
   /** Viewing the channel counts as having seen everything in it. */
@@ -2037,6 +2201,8 @@
     const row = t.closest('[data-ann]');
     if (!row) return;
     if (t.dataset.action === 'profile') { const a = Y.announcements.get(row.dataset.ann); if (a) profileCard(a.userId, t); return; }
+    if (t.dataset.action === 'open-att') return openAnnPicture(Y.announcements.get(row.dataset.ann), Number(t.dataset.i), t.dataset.save === '1');
+    if (t.dataset.action === 'ann-seen') return seenDialog(Y.announcements.get(row.dataset.ann));
     if (!canAnnounce()) return;
     if (t.dataset.action === 'ann-edit') return editAnnouncementDialog(Y.announcements.get(row.dataset.ann));
     if (t.dataset.action !== 'ann-withdraw') return;
@@ -2061,7 +2227,12 @@
     const m = UI.modal({ title: a.title || 'Announcement', cls: 'mid ann-pop', body: [
       h('div', { class: 'row', style: { gap: '10px', marginBottom: '12px' } }, UI.avatar(u, 32),
         h('div', null, h('div', { style: { fontWeight: '600' } }, A.name(a.userId)), h('div', { class: 'muted', style: { fontSize: '13px' } }, (A.roleLabel(a.userId) || 'Admin') + ' · ' + U.formatDateTime(a.ts) + (a.to ? ' · sent privately to you' + (a.to.length > 2 ? ` and ${a.to.length - 2} others` : '') : '')))),
-      h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, []) }),
+      a.text ? h('div', { class: 'msg-text ann-text', html: UI.formatText(a.text, a.mentions || []) }) : null,
+      a.attachments && a.attachments.length ? h('div', { class: 'ann-pics', 'data-ann': a.id, onclick: e => {
+        const t = e.target.closest('[data-action="open-att"]');
+        if (t) openAnnPicture(a, Number(t.dataset.i), t.dataset.save === '1');
+      } }, renderAttachments({ attachments: a.attachments })) : null,
+      (a.mentions || []).includes(meId()) ? h('p', { class: 'ann-later' }, icon('at'), 'You were mentioned in this announcement.') : null,
       h('p', { class: 'ann-later' }, icon('megaphone'), `You can read this again any time in ${feedName(feedOf(a))}, at the top of the sidebar.` + (more ? ` ${more} more after this one.` : ''))],
     foot: [
       h('button', { class: 'btn', onclick: () => { goView = true; m.close(); } }, feedOf(a) ? `Open ${feedName(feedOf(a))}` : 'View all announcements'),
@@ -2072,7 +2243,8 @@
       if (st.unmounting) return;
       if (goView) Chat.open(annKey(feedOf(a))); else setTimeout(showPendingAnnouncement, 300);
     } });
-    SC.app.notify({ title: 'Announcement: ' + (a.title || A.name(a.userId)), body: a.text.slice(0, 140), tag: 'ann-' + a.id });
+    loadAnnPics(m.el);
+    SC.app.notify({ title: 'Announcement: ' + (a.title || A.name(a.userId)), body: a.text ? a.text.slice(0, 140) : `📷 ${a.attachments.length} ${a.attachments.length === 1 ? 'picture' : 'pictures'}`, tag: 'ann-' + a.id });
   }
 
   /** Admins and the super admin can create polls in any conversation they're in. */
@@ -2113,9 +2285,37 @@
     let label = ''; // which group the list came from, for the super admin's activity feed
     const err = h('div', { class: 'form-error hidden', role: 'alert' });
     const title = h('input', { class: 'input', id: 'an-title', maxlength: 120, placeholder: 'e.g. Office closed on Friday' });
-    const text = h('textarea', { class: 'input', id: 'an-text', rows: 6, maxlength: String(Y.MAX_TEXT), placeholder: 'What do people need to know?' });
+    const text = h('textarea', { class: 'input', id: 'an-text', rows: 6, maxlength: String(Y.MAX_TEXT), placeholder: 'What do people need to know? Type @ to mention someone.' });
     const canPub = A.can('ann.post'), canPriv = A.can('ann.private');
     let priv = !canPub;
+    // @mentions: anyone for an announcement to everyone; only the chosen people for a private one
+    mentionField(text, () => (priv ? A.activeUsers().filter(u => pp.picked.has(u.id)) : A.activeUsers()));
+    // pictures (1.15): shown under the text, encrypted with the announcement when it's private
+    const pics = [];
+    const picBox = h('div', { class: 'chips ann-pick hidden' });
+    const picInput = h('input', { type: 'file', accept: 'image/png,image/jpeg,image/gif,image/webp,image/bmp', multiple: true, class: 'hidden', onchange: () => { addPics(picInput.files); picInput.value = ''; } });
+    const picBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => picInput.click() }, icon('image'), 'Add pictures');
+    function drawPics() {
+      UI.set(picBox, pics.map((f, i) => h('span', { class: 'chip-img', title: `${f.name} · ${U.formatSize(f.size)}` },
+        h('img', { src: localUrl(f), alt: f.name }),
+        h('button', { class: 'chip-img-x', type: 'button', 'aria-label': 'Remove ' + f.name, onclick: () => { forgetLocalUrl(f); pics.splice(i, 1); drawPics(); } }, icon('x')))));
+      picBox.classList.toggle('hidden', !pics.length);
+      picBtn.disabled = pics.length >= Y.MAX_ANN_FILES;
+    }
+    function addPics(list) {
+      for (const f of Array.from(list)) {
+        if (!isLocalImage(f)) { UI.toast(`“${f.name}” isn’t a picture. Announcements can have PNG, JPG, GIF, WebP or BMP pictures.`, 'error'); continue; }
+        if (f.size > Y.MAX_FILE) { UI.toast(`“${f.name}” is ${U.formatSize(f.size)}. The limit is 5 MB.`, 'error'); continue; }
+        if (pics.length >= Y.MAX_ANN_FILES) { UI.toast(`You can add up to ${Y.MAX_ANN_FILES} pictures.`, 'error'); break; }
+        if (pics.some(x => x.name === f.name && x.size === f.size)) continue;
+        pics.push(f);
+      }
+      drawPics();
+    }
+    text.addEventListener('paste', e => {
+      const files = Array.from(e.clipboardData ? e.clipboardData.files : []);
+      if (files.length) { e.preventDefault(); addPics(files); }
+    });
     const ok = h('button', { class: 'btn btn-primary' }, icon('megaphone'));
     // admins can only send private announcements inside their own group; the super admin to anyone
     const scope = Y.announceTeam();
@@ -2190,7 +2390,7 @@
     if (preset.team) { priv = true; drawSeg(); const s = sources.find(x => x.key === 'team:' + preset.team); if (s) toggleSource(s); }
     ok.addEventListener('click', () => UI.busy(ok, null, async () => {
       const n = pp.picked.size;
-      const id = await Y.postAnnouncement({ title: title.value, text: text.value, to: priv ? Array.from(pp.picked) : undefined, label });
+      const id = await Y.postAnnouncement({ title: title.value, text: text.value, to: priv ? Array.from(pp.picked) : undefined, label, files: pics });
       const f = feedOf(Y.announcements.get(id));
       m.close(); UI.toast(priv ? `Announcement sent to ${n} ${n === 1 ? 'person' : 'people'}` + (f ? ` · in ${feedName(f)}` : '') : 'Announcement posted', 'ok');
       if (isAnn() && annFeed() !== f) Chat.open(annKey(f));
@@ -2199,8 +2399,11 @@
       h('div', { class: 'field' }, h('span', { class: 'label' }, 'Who gets it'), seg),
       people,
       h('div', { class: 'field' }, h('label', { for: 'an-title' }, 'Title (optional)'), title),
-      h('div', { class: 'field' }, h('label', { for: 'an-text' }, 'Message'), text, hint)],
-    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+      h('div', { class: 'field' }, h('label', { for: 'an-text' }, 'Message'), text, picBox,
+        h('div', { class: 'row', style: { gap: '8px', margin: '6px 0 2px' } }, picBtn, h('span', { class: 'hint', style: { margin: 0 } }, `Up to ${Y.MAX_ANN_FILES} pictures, 5 MB each. You can also paste them.`), picInput),
+        hint)],
+    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok],
+    onClose: () => { pics.forEach(forgetLocalUrl); closeMention(); } });
     title.focus();
   }
 
@@ -2306,7 +2509,7 @@
     const where = t => h('span', { class: 'guide-where' }, t);
     const sections = [
       ['Announcements', 'megaphone', [
-        ['Post to everyone', 'A pop-up for all staff, kept in Announcements for a year. You can see who has read it.', openIn('New announcement', newAnnouncementDialog), 'ann.post'],
+        ['Post to everyone', 'A pop-up for all staff, kept in Announcements for a year. Add pictures and @mention people (they get a notification). You can see who has read it.', openIn('New announcement', newAnnouncementDialog), 'ann.post'],
         ['Announce privately', 'Send it only to chosen people (encrypted for them). Use “Add everyone in…” to send to a whole private channel or group at once.', openIn('New announcement', newAnnouncementDialog), 'ann.private'],
         ['Withdraw an announcement', 'It disappears for everyone.', where('Announcements → hover it → 🗑'), 'ann.withdraw'],
       ]],
@@ -2327,6 +2530,7 @@
         ['Move someone to another group', 'If they picked the wrong one, put them in the right group.', where('Admin settings → People → Change'), 'grp.accept'],
         ['Manage the project board', A.ownGroupOnly('board.manage') ? 'Create, assign, move, approve and receive projects on your group’s board.' : 'Create, assign, move, approve and receive projects on every group’s board.', where('Sidebar → Project boards'), 'board.manage'],
         ['Announce to one group', 'New announcement → Chosen people → Group name.', openIn('New announcement', newAnnouncementDialog), 'ann.private'],
+        ['Add events to the calendar', A.isOwner() ? 'For everyone or for one group. Everyone sees them under the calendar button next to the bell.' : 'For everyone or for your own group. Everyone sees them under the calendar button next to the bell.', openIn('Open the calendar', () => KV.open()), 'cal.manage'],
       ]],
       ['People', 'users', [
         ['Reset a password', 'Gives them a temporary password. Their direct messages from before the reset can’t be opened any more.', openIn('Admin settings', adminDialog), 'ppl.reset'],
@@ -2762,6 +2966,11 @@
         case 'newUser': return profileDialog(it.actor);
         case 'adm': case 'aud': return go(() => adminDialog('activity'));
         case 'ann': return go(() => Chat.open(ANN));
+        case 'annMention': {
+          const a = Y.announcements.get(it.ann);
+          if (!a) return UI.toast('That announcement was deleted.');
+          return go(() => Chat.open(annKey(feedOf(a))));
+        }
         default:
           if (it.conv && Y.chans.has(it.conv)) return go(() => Chat.open(it.conv));
       }
@@ -2779,12 +2988,14 @@
 
   function notifSettingsDialog() {
     const prefs = N.prefs();
-    const cats = ['mentions', 'groups', 'requests', 'board'].concat(A.isOwner() ? ['admin'] : []);
-    const boxes = cats.map(k => {
+    const cats = ['mentions', 'groups', 'requests', 'board', 'calendar'].concat(A.isOwner() ? ['admin'] : []);
+    const box = k => {
       const cb = h('input', { type: 'checkbox', id: 'np-' + k, checked: prefs[k] !== false });
       cb.addEventListener('change', () => N.setPref(k, cb.checked));
       return h('label', { class: 'check', for: 'np-' + k }, cb, h('span', null, N.PREF_LABELS[k]));
-    });
+    };
+    const boxes = cats.map(box);
+    const msgBoxes = ['dms', 'groupMsgs', 'channels'].map(box);
     const until = N.dndUntil();
     const tomorrow8 = () => { const d = new Date(); d.setDate(d.getDate() + 1); d.setHours(8, 0, 0, 0); return d.getTime(); };
     const dnd = h('select', { class: 'select', id: 'np-dnd', 'aria-label': 'Do not disturb' },
@@ -2804,8 +3015,9 @@
     const perm = SC.app.notificationState();
     const m = UI.modal({ title: 'Notification settings', cls: 'mid', body: [
       h('p', { class: 'muted', style: { fontSize: '14px', marginTop: 0 } }, 'The bell (top left) always keeps everything. These choose what also pops up on your desktop.'),
-      h('div', { class: 'field' }, h('span', { class: 'label' }, 'Pop up for'), boxes,
-        h('div', { class: 'hint' }, 'Direct messages and group chat messages always pop up, unless you mute that conversation in its Details.')),
+      h('div', { class: 'field' }, h('span', { class: 'label' }, 'New messages'), msgBoxes,
+        h('div', { class: 'hint' }, 'Mentions and replies pop up anywhere if “Mentions and replies” is on. To silence one conversation, mute it: ⋯ next to it in the sidebar, or its Details.')),
+      h('div', { class: 'field' }, h('span', { class: 'label' }, 'Also pop up for'), boxes),
       h('div', { class: 'field' }, h('label', { for: 'np-dnd' }, 'Do not disturb'), dnd, h('div', { class: 'hint' }, 'Silences pop-ups and sounds. Unread counts and the bell still update.')),
       perm === 'granted' ? null : h('div', { class: 'note note-info' }, icon('bell'), h('div', null, perm === 'denied'
         ? 'Desktop notifications are blocked for this page. Allow them in the browser’s site settings (the lock icon next to the address).'
@@ -2903,13 +3115,14 @@
     const title = h('input', { class: 'input', id: 'ea-title', maxlength: 120, value: a.title || '' });
     const text = h('textarea', { class: 'input', id: 'ea-text', rows: 6, maxlength: String(Y.MAX_TEXT) });
     text.value = a.text;
+    mentionField(text, () => A.activeUsers().filter(u => !a.to || a.to.includes(u.id)));
     const ok = h('button', { class: 'btn btn-primary' }, 'Save changes');
     ok.addEventListener('click', () => UI.busy(ok, null, async () => { await Y.editAnnouncement(a.id, { title: title.value, text: text.value }); m.close(); UI.toast('Announcement updated', 'ok'); }, err));
     const m = UI.modal({ title: 'Edit announcement', cls: 'mid', body: [err,
       h('div', { class: 'field' }, h('label', { for: 'ea-title' }, 'Title (optional)'), title),
       h('div', { class: 'field' }, h('label', { for: 'ea-text' }, 'Message'), text,
-        h('div', { class: 'hint' }, 'Everyone it was sent to sees the new text, marked “edited”. It doesn’t pop up again for people who already read it.'))],
-    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok] });
+        h('div', { class: 'hint' }, 'Everyone it was sent to sees the new text, marked “edited”. It doesn’t pop up again for people who already read it. Pictures can’t be changed.'))],
+    foot: [h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), ok], onClose: () => closeMention() });
     text.focus();
   }
 
@@ -2928,7 +3141,7 @@
         'History is kept. People invited later can read earlier messages.']),
       sec('announcements', 'megaphone', 'Announcements', ['“Everyone” announcements are not encrypted: anyone with access to the shared drive can read them.',
         'Private announcements are encrypted for the chosen people only. Sent to PICKUP GROUP or INPUT GROUP, they reach only people an admin has accepted into that group, so nobody in the other group can read them.',
-        'The list of who received a private announcement is visible on the shared drive; the title and text aren’t.',
+        'The list of who received a private announcement is visible on the shared drive; the title, text, pictures and mentions aren’t.',
         'The super admin is told when an admin sends a private announcement, with its title and how many people got it, never the text.']),
       sec('public', 'hash', 'Public channels', ['Not encrypted: anyone in the workspace can read them, and they’re stored as plain files on the shared drive.',
         'Don’t post passwords or personal information there.']),
@@ -2938,7 +3151,10 @@
         'Anyone with access to the shared drive can see who talks to whom and when (not what was said).']),
       sec('you', 'key', 'What you can do', ['Use a password nobody else knows, and lock the PC (⚙ → Lock) when you step away.',
         'Every profile has a security question (change it in ⚙ → Security question). If you forget your password, “Forgot password?” on the sign-in screen gets you back in with all your messages. Admins can’t use it, so your messages stay private.',
-        'In a direct message, compare the security code (Details) with the other person to be sure nobody swapped keys.']));
+        'In a direct message, compare the security code (Details) with the other person to be sure nobody swapped keys.',
+        'Pinned, muted, archived, deleted and blocked chats are saved encrypted so only you can read them. Blocking is silent: the other person isn’t told.']),
+      sec('calendar', 'calendar', 'Calendar', ['Events aren’t encrypted: anyone with access to the shared drive can read them. Don’t put private details in them.',
+        'An event for one group only shows in that group’s calendar (and the super admin’s).']));
     UI.modal({ title: 'Privacy and security', cls: 'mid', body });
     if (focus) setTimeout(() => { const f = body.querySelector('.privacy-sec.focus'); if (f) f.scrollIntoView({ block: 'start' }); }, 50);
   }
@@ -2947,6 +3163,13 @@
 
   /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
   const NEWS = [
+    { version: '1.15.0', items: [
+      ['image', 'Pictures and @mentions in announcements', 'Admins can add up to 10 pictures to an announcement, and type @ to mention someone. The people mentioned get a notification in the bell.'],
+      ['check', 'See who has seen an announcement', 'Admins see the faces of the last five people who saw it. “See more” lists everyone who has seen it, and who hasn’t yet.'],
+      ['message', 'Pin, mute, archive, delete or block a chat', 'Hover a direct message in the sidebar and click ⋯ (or right-click it). Delete chat only clears it for you. Blocking is silent. These follow you to every PC you use.'],
+      ['bell', 'Choose which messages pop up', '⚙ → Notification settings: direct messages, group chats and public channels each have their own switch.'],
+      ['calendar', 'Calendar', 'The calendar button next to the bell shows events for everyone and for your group. Admins add them; a red number means new or changed events.'],
+    ] },
     { version: '1.14.0', items: [
       ['refresh', 'Startup no longer gets stuck', 'If the browser’s saved data or the shared drive doesn’t answer when the app starts, you now see the Connect or Reconnect screen after a few seconds instead of an endless “Starting Sankyo Chat…”.'],
     ] },
