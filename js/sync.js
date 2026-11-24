@@ -1738,8 +1738,9 @@
 
   /* ---- polls in announcements (1.16) ----
    * An announcement can carry a poll: {question, options: [{id, text}]}, in the signed announcement (inside the
-   * encrypted part for a private one). Only staff vote: the people it was sent to, except admins, the super admin
-   * and its author, who see the results. Each voter writes their own file, announcements/votes/<announcementId>/
+   * encrypted part for a private one). Since 1.17 everyone who can read it votes: everyone for an announcement to
+   * everyone, the recipients (and the author) for a private one, admins and the super admin included. (In 1.16 only
+   * staff voted: admins, the super admin and the author saw the results.) Each voter writes their own file, announcements/votes/<announcementId>/
    * <userId>.json, signed by them and overwritten when they change their vote (one writer per file):
    * {choice: optionId, or '' when they take it back}, encrypted with the announcement's key for a private one.
    * Every app checks the signature and that the voter may vote; the newest file per person counts. */
@@ -1752,7 +1753,7 @@
     return { question: typeof p.question === 'string' ? p.question.replace(/\s+/g, ' ').trim().slice(0, 300) : '', options };
   }
   /** May this person vote in this announcement's poll? Staff it was sent to; not admins, the super admin or the author. */
-  const mayVote = (a, uid) => !!a.poll && uid !== a.userId && !A.isUserAdmin(uid) && !A.isRemoved(uid) && (!a.to || a.to.includes(uid));
+  const mayVote = (a, uid) => !!a.poll && !A.isRemoved(uid) && (!a.to || a.to.includes(uid));
   Y.canVoteAnn = a => !!a && !!A.me && mayVote(a, me());
   /** My vote: an option id, or ''. */
   Y.annVote = a => { const v = a && a.votes && a.votes.get(me()); return v ? v.choice : ''; };
@@ -1796,7 +1797,7 @@
   Y.voteAnnouncement = async function (id, optionId) {
     const a = Y.announcements.get(id);
     if (!a || !a.poll) throw err('That poll is no longer there.');
-    if (!Y.canVoteAnn(a)) throw err(A.isAdmin() ? 'Admins see the results. Only staff vote.' : 'You can’t vote in this poll.');
+    if (!Y.canVoteAnn(a)) throw err('You can’t vote in this poll.');
     if (!a.poll.options.some(o => o.id === optionId)) throw err('That option is no longer there.');
     if (!Y.connected) throw err('Lost access to the shared folder', 'OFFLINE');
     const choice = Y.annVote(a) === optionId ? '' : optionId;

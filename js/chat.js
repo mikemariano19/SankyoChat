@@ -2167,7 +2167,7 @@
     const mineV = Y.annVote(a);
     const can = Y.canVoteAnn(a);
     return h('div', { class: 'poll ann-poll' },
-      h('div', { class: 'poll-head' }, icon('poll'), h('span', null, 'Poll'), h('span', { class: 'muted' }, ' · staff vote, one vote each')),
+      h('div', { class: 'poll-head' }, icon('poll'), h('span', null, 'Poll'), h('span', { class: 'muted' }, ' · everyone votes, one vote each')),
       a.poll.question ? h('div', { class: 'poll-q' }, a.poll.question) : null,
       h('div', { class: 'poll-opts', role: 'radiogroup', 'aria-label': 'Poll options' }, a.poll.options.map(o => {
         const voters = r.byOption.get(o.id) || [];
@@ -2176,7 +2176,7 @@
         const faces = voters.slice(0, VOTE_FACES).map(id => A.users.get(id)).filter(Boolean);
         return h('div', { class: 'ann-opt' },
           h('button', { class: 'poll-opt' + (picked ? ' picked' : ''), type: 'button', 'data-action': 'ann-vote', 'data-opt': o.id, disabled: !can, role: 'radio', 'aria-checked': String(picked),
-            title: can ? (picked ? 'Click again to take your vote back' : 'Vote for this') : 'Only staff vote' },
+            title: can ? (picked ? 'Click again to take your vote back' : 'Vote for this') : 'You can’t vote in this poll' },
           h('span', { class: 'poll-fill', style: { width: pct + '%' } }),
           h('span', { class: 'poll-check' }, picked ? icon('check') : null),
           h('span', { class: 'poll-txt' }, o.text),
@@ -2187,7 +2187,7 @@
             voters.length > VOTE_FACES ? h('button', { class: 'link-btn ann-seen-more', type: 'button', 'data-action': 'ann-votes', 'data-opt': o.id }, `See more (+${voters.length - VOTE_FACES})`) : null) : null);
       })),
       h('div', { class: 'poll-foot' }, `${r.voters} ${r.voters === 1 ? 'person' : 'people'} voted` +
-        (can ? (mineV ? ' · pick another option to change your vote' : '') : A.me && a.userId === meId() ? ' · you posted it, so you see the results' : ' · only staff vote')));
+        (can && mineV ? ' · pick another option to change your vote' : '')));
   }
   function onAnnPoll(t, a) {
     if (!a || !a.poll) return;
@@ -2209,7 +2209,7 @@
       UI.set(list, ids.length ? ids.map(id => A.users.get(id)).filter(Boolean).map(u => h('div', { class: 'person', onclick: () => profileDialog(u.id) }, UI.avatar(u, 32),
         h('div', { style: { flex: 1, minWidth: 0 } }, h('div', { class: 'nm' }, u.name), h('div', { class: 'sub' }, 'Voted ' + U.formatDateTime(res.at(u.id))))))
         : h('div', { class: 'muted', style: { padding: '10px' } }, 'Nobody picked this yet.'),
-      h('div', { class: 'muted', style: { fontSize: '13px', padding: '8px 2px 0' } }, `${res.voters} of ${r.audience.filter(u => !A.isUserAdmin(u.id)).length} staff voted.`));
+      h('div', { class: 'muted', style: { fontSize: '13px', padding: '8px 2px 0' } }, `${res.voters} of ${r.audience.length + 1} ${r.audience.length ? 'people' : 'person'} voted.`));
     }
     const unsub = Y.events.on('announcements', draw);
     const m = UI.modal({ title: a.poll.question ? `Votes: ${a.poll.question}` : 'Votes', cls: 'mid', body: [tabs, list], onClose: unsub });
@@ -2380,7 +2380,7 @@
       const files = Array.from(e.clipboardData ? e.clipboardData.files : []);
       if (files.length) { e.preventDefault(); addPics(files); }
     });
-    // poll (1.16): staff vote on it; admins see the results
+    // poll (1.16): everyone it's sent to votes on it (1.17: admins and the author too)
     let pollOn = false;
     const pollQ = h('input', { class: 'input', id: 'an-poll-q', maxlength: 300, placeholder: 'Question (optional), e.g. Which day suits you?' });
     const pollOpts = ['', ''];
@@ -2401,7 +2401,7 @@
       h('div', { class: 'row', style: { justifyContent: 'space-between', marginBottom: '6px' } }, h('span', { class: 'label', style: { margin: 0 } }, icon('poll'), ' Poll'),
         h('button', { class: 'link-btn', type: 'button', onclick: () => setPoll(false) }, 'Remove poll')),
       pollQ, pollList, h('div', null, pollAdd),
-      h('div', { class: 'hint' }, 'Staff get one vote each and can change it. Admins see the results. Everyone sees who picked what.'));
+      h('div', { class: 'hint' }, 'Everyone it’s sent to, admins and you included, gets one vote and can change it. Everyone sees who picked what.'));
     const pollBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => setPoll(true) }, icon('poll'), 'Add a poll');
     function setPoll(on) {
       pollOn = on;
@@ -3258,8 +3258,11 @@
 
   /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
   const NEWS = [
+    { version: '1.17.0', items: [
+      ['poll', 'Everyone can vote in announcement polls', 'Admins, the super admin and whoever posted the announcement can now vote too, like everyone else it was sent to.'],
+    ] },
     { version: '1.16.0', items: [
-      ['poll', 'Polls in announcements', 'Admins can add a poll to any announcement (New announcement → Add a poll). Staff vote right in the pop-up or in Announcements, and can change their vote. Each option shows who picked it: five faces, then “See more”.'],
+      ['poll', 'Polls in announcements', 'Admins can add a poll to any announcement (New announcement → Add a poll). People vote right in the pop-up or in Announcements, and can change their vote. Each option shows who picked it: five faces, then “See more”.'],
     ] },
     { version: '1.15.0', items: [
       ['image', 'Pictures and @mentions in announcements', 'Admins can add up to 10 pictures to an announcement, and type @ to mention someone. The people mentioned get a notification in the bell.'],
