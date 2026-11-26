@@ -108,7 +108,9 @@
   N.list = function (tab) {
     return Array.from(items.values()).filter(it => !tab || tab === 'all' || N.category(it) === tab).sort((a, b) => (b.at || b.ts) - (a.at || a.ts)).slice(0, 200);
   };
-  N.isUnread = it => it.ts > Y.notifRead() && !Y.notifSeen(it.id) && !it.done;
+  /** A mention, reply or @here whose conversation I've already read past it counts as read too. */
+  const MSG_TYPES = new Set(['mention', 'reply', 'here']);
+  N.isUnread = it => it.ts > Y.notifRead() && !Y.notifSeen(it.id) && !it.done && !(MSG_TYPES.has(it.type) && it.conv && it.ts <= Y.lastRead(it.conv));
   N.unreadCount = () => { let n = 0; for (const it of items.values()) if (N.isUnread(it)) n++; return n; };
   N.pendingRequests = () => N.list('requests').filter(it => it.type === 'request' && !it.done).length;
   N.markAllRead = function () {

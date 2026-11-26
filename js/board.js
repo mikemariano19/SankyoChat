@@ -56,6 +56,8 @@
   /** Approving a Done project on this board sends it to that board's Review. */
   B.HANDOFF = { t1: 't2' };
   B.MAX_MEMBERS = 30;
+  B.MAX_NOTE = 1000;
+  const cleanNote = s => String(s || '').replace(/\r\n?/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   B.NOTE_DAYS = 30;
   const HINT = 'board:all';
   const DIR = 'board';
@@ -92,6 +94,7 @@
       order: Number.isFinite(raw.order) ? raw.order : 0,
       deleted: raw.deleted === true,
       name: typeof raw.name === 'string' ? raw.name.replace(/\s+/g, ' ').trim().slice(0, 80) : '',
+      note: typeof raw.note === 'string' ? cleanNote(raw.note).slice(0, B.MAX_NOTE) : '',
       prio: [1, 2, 3].includes(raw.prio) ? raw.prio : 2,
       label: LABEL_IDS.includes(raw.label) ? raw.label : '',
       team: typeof raw.team === 'string' && /^[a-z0-9]{1,8}$/.test(raw.team) ? raw.team : '',
@@ -275,6 +278,7 @@
         if (r.name !== prev.name) what.push(r.name ? `named it “${r.name}”` : 'cleared the project name');
         if (r.prio !== prev.prio) what.push(`set priority to ${B.PRIOS[r.prio]}`);
         if (r.label !== prev.label) what.push(r.label ? `labeled it ${B.labelName(r.label)}` : 'removed the label');
+        if (r.note !== prev.note) what.push(!r.note ? 'removed the note' : prev.note ? 'edited the note' : 'added a note');
       }
       if (what.length) out.push({ ts: r.ts, userId: r.userId, text: what.join(', ') });
       prev = r;
@@ -324,11 +328,13 @@
     if (!B.inGroup(by, team)) throw err(`The superior must be an admin of ${A.teamName(team)} or the super admin.`);
     const name = String(f.name || '').replace(/\s+/g, ' ').trim();
     if (name.length > 80) throw err('Project names can be at most 80 characters.');
+    const note = cleanNote(f.note);
+    if (note.length > B.MAX_NOTE) throw err(`Notes can be at most ${B.MAX_NOTE} characters.`);
     const prio = [1, 2, 3].includes(Number(f.prio)) ? Number(f.prio) : 2;
     const allowed = B.labelsFor(team);
     if (!allowed.some(l => l.id === f.label)) throw err(`Choose a label: ${allowed.map(l => l.name).join(', ').replace(/, ([^,]*)$/, ' or $1')}.`);
     const label = f.label;
-    return { number, members, pct, deadline, by, name, prio, label, team };
+    return { number, members, pct, deadline, by, name, note, prio, label, team };
   }
   const endOf = (col, team) => { const l = B.inCol(col, team); return l.length ? l[l.length - 1].order + 1024 : 1024; };
 
@@ -349,7 +355,7 @@
     locked(p);
     // fields left out keep their current value
     f = Object.assign({}, f);
-    for (const k of ['name', 'prio', 'label']) if (f[k] === undefined) f[k] = p[k];
+    for (const k of ['name', 'note', 'prio', 'label']) if (f[k] === undefined) f[k] = p[k];
     const col = COL_IDS.includes(f.col) ? f.col : p.col;
     const v = checkFields(f, pid, p.team, col);
     return write(pid, Object.assign(v, { col, order: col === p.col ? p.order : endOf(col, p.team), deleted: false }));
@@ -360,15 +366,15 @@
     if (!p) throw err('That project was deleted.');
     locked(p);
     if (!p.members.length && B.needsMembers(col)) throw noMembersErr(col);
-    const { number, members, pct, deadline, by, name, prio, label, team } = p;
-    return write(pid, { number, members, pct, deadline, by, name, prio, label, team, col, order, deleted: false });
+    const { number, members, pct, deadline, by, name, note, prio, label, team } = p;
+    return write(pid, { number, members, pct, deadline, by, name, note, prio, label, team, col, order, deleted: false });
   };
   B.remove = async function (pid) {
     const p = B.get(pid);
     if (!p) return Promise.resolve();
     locked(p);
-    const { number, members, pct, deadline, by, name, prio, label, team, col, order } = p;
-    return write(pid, { number, members, pct, deadline, by, name, prio, label, team, col, order, deleted: true });
+    const { number, members, pct, deadline, by, name, note, prio, label, team, col, order } = p;
+    return write(pid, { number, members, pct, deadline, by, name, note, prio, label, team, col, order, deleted: true });
   };
 
   /* ---- approval and hand-off (PICKUP → INPUT) ---- */
@@ -380,8 +386,8 @@
 
   async function sendHandoff(p) {
     const to = B.handoffTo(p.team);
-    const { number, name, prio, deadline } = p;
-    return write(p.handoff, { number, name, prio, deadline, members: [], pct: 0, by: me(), label: 'input', team: to,
+    const { number, name, note, prio, deadline } = p;
+    return write(p.handoff, { number, name, note, prio, deadline, members: [], pct: 0, by: me(), label: 'input', team: to,
       col: 'review', order: endOf('review', to), deleted: false, from: { pid: p.pid, team: p.team } }, true);
   }
   /** Approve a Done project: lock it here and put a copy in the next board's Review, unassigned. */
@@ -396,8 +402,8 @@
     const dup = B.inTeam(to).find(x => x.number.toLowerCase() === p.number.toLowerCase());
     if (dup) throw err(`${p.number} is already on the ${A.teamName(to)} board (in ${B.colName(dup.col)}).`);
     const handoff = 'p_' + U.rand(8);
-    const { number, members, pct, deadline, by, name, prio, label, team, col, order } = p;
-    await write(pid, { number, members, pct, deadline, by, name, prio, label, team, col, order, deleted: false, approved: { by: me(), ts: Date.now() }, handoff });
+    const { number, members, pct, deadline, by, name, note, prio, label, team, col, order } = p;
+    await write(pid, { number, members, pct, deadline, by, name, note, prio, label, team, col, order, deleted: false, approved: { by: me(), ts: Date.now() }, handoff });
     await sendHandoff(B.get(pid));
     return handoff;
   };
@@ -412,9 +418,9 @@
     if (!p) throw err('That project was deleted.');
     if (!B.isPending(p)) throw err(`${p.number} was already received${p.received ? ' by ' + A.name(p.received.by) : ''}.`);
     if (!B.canEdit(p.team)) throw err(`Only admins of ${A.teamName(p.team)} can receive it.`);
-    const { number, members, pct, deadline, name, prio, label, team, col, order } = p;
+    const { number, members, pct, deadline, name, note, prio, label, team, col, order } = p;
     // the receiving admin becomes its superior here (the PICKUP approver stays in its 'from' line)
-    return write(pid, { number, members, pct, deadline, by: me(), name, prio, label, team, col, order, deleted: false, received: { by: me(), ts: Date.now() } });
+    return write(pid, { number, members, pct, deadline, by: me(), name, note, prio, label, team, col, order, deleted: false, received: { by: me(), ts: Date.now() } });
   };
   /** INPUT's Done is the last step: an admin of that board confirms it, and it moves to History. */
   B.isFinalBoard = team => !!team && !B.HANDOFF[team];
@@ -426,8 +432,8 @@
     if (!B.isFinalBoard(p.team)) throw err(`On this board, approve it instead: it goes on to ${A.teamName(B.handoffTo(p.team))}.`);
     if (!B.canEdit(p.team)) throw err(`Only admins of ${A.teamName(p.team)} can confirm it.`);
     locked(p);
-    const { number, members, pct, deadline, by, name, prio, label, team, col, order } = p;
-    return write(pid, { number, members, pct, deadline, by, name, prio, label, team, col, order, deleted: false, completed: { by: me(), ts: Date.now() } });
+    const { number, members, pct, deadline, by, name, note, prio, label, team, col, order } = p;
+    return write(pid, { number, members, pct, deadline, by, name, note, prio, label, team, col, order, deleted: false, completed: { by: me(), ts: Date.now() } });
   };
   B.resendHandoff = async function (pid) {
     const p = B.get(pid);

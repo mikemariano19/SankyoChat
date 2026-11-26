@@ -4,10 +4,11 @@ A team chat app made of plain HTML, CSS and JavaScript. It runs with no internet
 
 **Requirements:** Microsoft Edge or Google Chrome, version 110 or newer. Nothing gets installed.
 
-**Current version:** 1.17.0 (`js/version.js`)
+**Current version:** 1.18.0 (`js/version.js`)
 
 ### What's new
 
+- **1.18: Read state follows you, project notes.** What you've read is now saved (encrypted) in your settings file in `data\prefs`, so a private/incognito window or another PC no longer shows old messages as unread. A desktop notification goes away once its conversation is read, here or on another PC, and a message already read elsewhere doesn't pop up. Project cards can carry a note (shown with a **Note** badge). Note: desktop pop-ups themselves can't appear in a Chrome incognito window, because Chrome always blocks notifications there; the sound and unread counts still work.
 - **1.17: Everyone votes in announcement polls.** Admins, the super admin and the person who posted the announcement can now vote too, like everyone else it was sent to. Update every PC: apps still on 1.16 don't count their votes.
 - **1.16: Polls in announcements.** New announcement → **Add a poll** (a question and 2–10 options), for announcements to everyone or private ones. People vote in the pop-up or in Announcements, one vote each, and can change or take it back (since 1.17 everyone it was sent to votes, admins and the author included). Each option shows the faces of the last five people who picked it, then **See more** for everyone. See [Polls in announcements](#polls-in-announcements-116).
 - **1.15: Announcement pictures and mentions, chat options, calendar.** Announcements can carry up to 10 pictures and @mentions (the people mentioned get a notification). Admins see the faces of the last five people who saw an announcement, with **See more** for the full list. Each direct message has a ⋯ menu: pin, mute, archive, delete chat (for you only) and block. ⚙ → Notification settings has separate switches for direct messages, group chats and public channels. A **calendar** next to the bell shows events that admins add for everyone or for one group. See [Calendar](#calendar-115) and [Chat options](#chat-options-115).

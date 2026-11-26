@@ -58,6 +58,8 @@
     } catch { /* no audio */ }
   }
   let lastChime = 0;
+  /** tag → the desktop notification still showing for it, so it can be taken away once it's been read */
+  const showing = new Map();
   App.notify = function ({ title, body, tag, onClick }) {
     if (SC.notify && SC.notify.isQuiet()) return; // Do Not Disturb
     if (Date.now() - lastChime > 1500) { chime(); lastChime = Date.now(); }
@@ -65,7 +67,15 @@
     try {
       const n = new Notification(title, { body, tag, renotify: true, silent: true, icon: 'assets/icon.svg' });
       n.onclick = () => { root.focus(); if (onClick) onClick(); n.close(); };
+      if (tag) { showing.set(tag, n); n.onclose = () => { if (showing.get(tag) === n) showing.delete(tag); }; }
     } catch { /* ignore */ }
+  };
+  /** Take a desktop notification away (e.g. the conversation was read here or on another PC). */
+  App.closeNotification = function (tag) {
+    const n = showing.get(tag);
+    if (!n) return;
+    showing.delete(tag);
+    try { n.close(); } catch { /* ignore */ }
   };
 
   /* ================= idle, auto-lock, visibility ================= */

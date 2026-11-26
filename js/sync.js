@@ -100,9 +100,13 @@
    *   pinned, muted, archived: {conversationId: ts}
    *   cleared: {conversationId: ts}: "Delete chat" hides every message up to ts, for me only
    *   blocked: {userId: {since, periods: [[from, to], …]}}: their direct messages from those times are hidden for me.
+   *   read: {conversationId: ts of the newest message I've read} (1.18). Also kept in this browser's storage, but a
+   *     private (incognito) window starts with empty storage every time, so without this copy every old message
+   *     would count as unread again there. It also carries "read" between my PCs.
    * Blocking is silent: nothing is written where they could see it, so they can't tell. Their messages never show
    * "Seen", because I never read them. */
-  const emptyPrefs = () => ({ pinned: {}, muted: {}, archived: {}, cleared: {}, blocked: {} });
+  const emptyPrefs = () => ({ pinned: {}, muted: {}, archived: {}, cleared: {}, blocked: {}, read: {} });
+  const MAX_READ = 500;
   let prefs = emptyPrefs(), prefsTs = 0, prefsMtime = 0, prefsQueue = Promise.resolve();
   const prefsPath = () => `prefs/${me()}.json`;
   const prefsAad = ts => 'prefs|' + me() + '|' + ts;
@@ -118,6 +122,9 @@
       const src = o[k] && typeof o[k] === 'object' ? o[k] : {};
       for (const [id, v] of Object.entries(src)) if (ID_RE.test(id) && typeof v === 'number') out[k][id] = v;
     }
+    const rd = o.read && typeof o.read === 'object' ? o.read : {};
+    Object.entries(rd).filter(([id, v]) => ID_RE.test(id) && typeof v === 'number' && v > 0)
+      .sort((x, y) => y[1] - x[1]).slice(0, MAX_READ).forEach(([id, v]) => { out.read[id] = v; });
     const b = o.blocked && typeof o.blocked === 'object' ? o.blocked : {};
     for (const [uid, v] of Object.entries(b)) {
       if (!/^[a-z0-9]{4}$/.test(uid) || !v || typeof v !== 'object') continue;
@@ -146,15 +153,16 @@
     try { body = await C.decryptJSON(await prefsKey(), raw.enc, prefsAad(raw.ts)); } catch { return false; }
     prefs = cleanPrefs(body);
     prefsTs = raw.ts;
+    mergeRead();
     afterPrefs();
     return true;
   }
   Y.refreshPrefs = () => loadPrefs().catch(handleErr);
   /** Change my settings: shown at once, then written on top of the newest copy. `fn` must set absolute values,
    *  because it runs twice (now, and again after the newest copy is read). */
-  function changePrefs(fn) {
+  function changePrefs(fn, quiet) {
     fn(prefs);
-    afterPrefs();
+    if (!quiet) afterPrefs();
     const who = A.me;
     const run = prefsQueue.catch(() => {}).then(async () => {
       if (A.me !== who) return;
@@ -168,7 +176,7 @@
       await S.writeJSON(prefsPath(), raw);
       const f = await S.readFile(prefsPath()).catch(() => null);
       if (f) prefsMtime = f.lastModified; // my own write isn't news
-      afterPrefs();
+      if (!quiet) afterPrefs();
     });
     prefsQueue = run;
     return run.catch(e => { handleErr(e); throw err(friendly(e)); });
@@ -557,9 +565,32 @@
       readMap[ch.id] = last;
       U.ls.set(readKeyName(), readMap);
       recount(ch);
+      Y.events.emit('read', ch);
+      saveReadSoon();
       if (ch.kind !== 'public' && Y.receiptsOn()) heartbeat(); // tell the others promptly
     }
   };
+  /** Copy my read positions into my settings file (see "my conversation settings"), a few seconds after reading. */
+  function readBehind() { return Object.keys(readMap).some(id => ID_RE.test(id) && readMap[id] > (prefs.read[id] || 0)); }
+  const saveReadSoon = U.debounce(() => {
+    if (!A.me || !running || !readBehind()) return;
+    changePrefs(p => {
+      for (const [id, v] of Object.entries(readMap)) if (ID_RE.test(id) && typeof v === 'number' && v > (p.read[id] || 0)) p.read[id] = v;
+      const ids = Object.keys(p.read);
+      if (ids.length > MAX_READ) ids.sort((x, y) => p.read[y] - p.read[x]).slice(MAX_READ).forEach(id => { delete p.read[id]; });
+    }, true).catch(() => {});
+  }, 4000);
+  /** Read positions from my settings file (another PC, or this browser's storage was empty): take the newer one. */
+  function mergeRead() {
+    let dirty = false;
+    for (const [id, v] of Object.entries(prefs.read)) {
+      if (!(v > (readMap[id] || 0))) continue;
+      readMap[id] = v; dirty = true;
+      const ch = chans.get(id);
+      if (ch) { recount(ch); Y.events.emit('read', ch); }
+    }
+    if (dirty) U.ls.set(readKeyName(), readMap);
+  }
 
   /* ---- read receipts ("Seen by") ----
    * Each person's presence file carries seen = {conversationId: ts of the newest message they've read},
@@ -1472,6 +1503,7 @@
     prefs = emptyPrefs(); prefsTs = 0; prefsMtime = 0; prefsQueue = Promise.resolve();
     try { await loadPrefs(); } catch (e) { console.warn('prefs', e); }
     migrateLocalMutes();
+    if (readBehind()) saveReadSoon(); // read positions saved before 1.18 only lived in this browser
     const cur = await S.readJSON(`presence/${me()}.json`);
     if (cur && cur.userId === me()) {
       mine.lastPost = Object.assign({}, cur.lastPost);

@@ -874,6 +874,13 @@ input, textarea, select, [contenteditable="true"] { caret-color: auto; }
 .bd-fchip.bd-lab-input[aria-pressed="true"], .bd-fchip.bd-lab-correction[aria-pressed="true"] { background: var(--lab-soft); border-color: var(--lab); color: var(--lab); }
 .bd-fchip.bd-p1[aria-pressed="true"] { background: var(--pr-soft); border-color: var(--pr); color: var(--pr); }
 .bd-view-name { font-size: 15px; color: var(--text-2); margin: -6px 0 14px; }
+.bd-note-tag { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; font-weight: 700; padding: 2px 7px 2px 5px; border-radius: 6px; color: #92400E; background: #FEF3C7; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .bd-note-tag { color: #FCD34D; background: rgba(252, 211, 77, .14); } }
+:root[data-theme="dark"] .bd-note-tag { color: #FCD34D; background: rgba(252, 211, 77, .14); }
+.bd-note-tag .icon { width: 12px; height: 12px; }
+.bd-note-input { min-height: 72px; line-height: 1.45; }
+.bd-note-count { font-weight: 400; font-size: 12px; }
+.bd-view-note { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.45; background: var(--surface-2); border-radius: 8px; padding: 8px 10px; }
 .bd-two .bd-seg button { min-width: 0; }
 
 /* project board: superior as an initial circle; label at the top right */
@@ -1125,6 +1132,9 @@ input, textarea, select, [contenteditable="true"] { caret-color: auto; }
 .cal-day:hover { background: var(--hover, var(--surface-2)); }
 .cal-day.out { background: var(--bg-soft, var(--surface-2)); color: var(--muted); }
 .cal-day.out .cal-chip { opacity: .6; }
+/* no scrollbar: it made the day grid narrower than the weekday row, so the columns didn't line up (wheel and keys still scroll) */
+.cal-scroll { scrollbar-width: none; }
+.cal-scroll::-webkit-scrollbar { display: none; }
 .cal-chip { transition: opacity .25s ease; }
 .cal-day.first .cal-num { font-weight: 700; }
 .cal-day.sel { box-shadow: inset 0 0 0 2px var(--accent); }
@@ -1174,3 +1184,5 @@ input, textarea, select, [contenteditable="true"] { caret-color: auto; }
 .ann-poll-edit .label { display: inline-flex; align-items: center; gap: 6px; }
 .ann-poll-edit .poll-edit { margin: 0; }
 .ann-pop-poll .ann-poll { margin: 4px 0 8px; }
+/* project board: the note bubble shown when hovering a card's Note badge (opens above it, clear of the pointer) */
+.bd-note-pop { position: fixed; z-index: 1000; max-width: 320px; max-height: 260px; overflow: hidden; padding: 8px 10px; border-radius: 8px; background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); box-shadow: 0 8px 24px rgba(0, 0, 0, .25); font-size: 13px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; pointer-events: none; }

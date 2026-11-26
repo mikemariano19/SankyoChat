@@ -96,6 +96,7 @@
     st.els = { root, q, scope, filters, cols, summary };
     cols.addEventListener('click', onClick);
     cols.addEventListener('keydown', onKey);
+    watchNotes(cols);
     if (B.canEdit(st.team)) setupDrag(cols);
   }
 
@@ -120,7 +121,7 @@
         B.canEdit(st.team) ? h('button', { class: 'btn btn-primary', onclick: () => V.projectDialog(null) }, icon('plus'), 'New project') : null));
       return;
     }
-    UI.set(e.cols, B.COLS.map(c => {
+    const next = B.COLS.map(c => {
       const inCol = B.inCol(c.id, st.team), shown = inCol.filter(matches);
       const filtered = shown.length !== inCol.length;
       return h('section', { class: 'bd-col bd-c-' + c.id, 'data-col': c.id, 'aria-label': c.name },
@@ -129,14 +130,53 @@
           B.canEdit(st.team) ? h('button', { class: 'icon-btn bd-add', 'aria-label': `New project in ${c.name}`, title: `New project in ${c.name}`, onclick: () => V.projectDialog(null, c.id) }, icon('plus')) : null),
         h('div', { class: 'bd-list', 'data-col': c.id },
           shown.length ? shown.map(card) : h('div', { class: 'bd-empty' }, filtered ? 'Nothing matches' : B.canEdit(st.team) ? 'Drag a project here' : 'Nothing here')));
-    }));
-    if (focusPid) { const n = e.cols.querySelector(`.bd-card[data-pid="${CSS.escape(focusPid)}"]`); if (n) n.focus(); }
+    });
+    // A sync or refresh redraws the board. If nothing visible changed, leave the DOM alone (no flicker,
+    // hover and scroll untouched). Otherwise swap it in and put every column's scroll position back.
+    const tmp = document.createElement('div');
+    next.forEach(n => tmp.appendChild(n));
+    if (tmp.innerHTML === e.cols.innerHTML) return;
+    const scrolls = {};
+    e.cols.querySelectorAll('.bd-list[data-col]').forEach(l => { scrolls[l.dataset.col] = l.scrollTop; });
+    const left = e.cols.scrollLeft;
+    hideNote(); // its badge is about to be replaced
+    UI.set(e.cols, next);
+    e.cols.querySelectorAll('.bd-list[data-col]').forEach(l => { if (scrolls[l.dataset.col]) l.scrollTop = scrolls[l.dataset.col]; });
+    e.cols.scrollLeft = left;
+    if (focusPid) { const n = e.cols.querySelector(`.bd-card[data-pid="${CSS.escape(focusPid)}"]`); if (n && n !== document.activeElement) n.focus({ preventScroll: true }); }
+  }
+
+  /** Badge on a card that has a note; hovering shows the note in a bubble above the badge (not the browser's
+   *  tooltip, which opens under the mouse pointer and hides part of the text). */
+  function noteTag(note) {
+    if (!note) return null;
+    return h('span', { class: 'bd-note-tag', 'data-note': note }, icon('file'), 'Note');
+  }
+  let notePop = null;
+  function hideNote() { if (notePop) { notePop.remove(); notePop = null; } }
+  function showNote(tag) {
+    hideNote();
+    const r = tag.getBoundingClientRect();
+    notePop = h('div', { class: 'bd-note-pop', role: 'tooltip' }, tag.dataset.note);
+    document.body.appendChild(notePop);
+    const w = notePop.offsetWidth, ht = notePop.offsetHeight, gap = 8;
+    const left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8));
+    // above the badge if it fits, otherwise below it: never under the pointer
+    const top = r.top - ht - gap >= 8 ? r.top - ht - gap : r.bottom + gap;
+    notePop.style.left = left + 'px';
+    notePop.style.top = top + 'px';
+  }
+  function watchNotes(cols) {
+    cols.addEventListener('mouseover', e => { const t = e.target.closest('.bd-note-tag'); if (t && (!notePop || notePop.textContent !== t.dataset.note)) showNote(t); });
+    cols.addEventListener('mouseout', e => { const t = e.target.closest('.bd-note-tag'); if (t && !t.contains(e.relatedTarget)) hideNote(); });
+    cols.addEventListener('scroll', hideNote, true);
+    cols.addEventListener('dragstart', hideNote);
   }
 
   function card(p) {
     const dl = deadlineInfo(p);
     const mine = B.isMine(p);
-    const label = `Project ${p.number}` + (p.name ? `, ${p.name}` : '') + `, ${B.PRIOS[p.prio]} priority` + (p.label && p.label !== 'none' ? `, ${B.labelName(p.label)}` : '') + `, ${B.colName(p.col)}, ${p.pct}% done` + (dl ? `, ${dl.title}` : '') + `. Members: ${p.members.map(A.name).join(', ')}. Assigned by ${A.name(p.by)}.`;
+    const label = `Project ${p.number}` + (p.name ? `, ${p.name}` : '') + `, ${B.PRIOS[p.prio]} priority` + (p.label && p.label !== 'none' ? `, ${B.labelName(p.label)}` : '') + `, ${B.colName(p.col)}, ${p.pct}% done` + (dl ? `, ${dl.title}` : '') + `. Members: ${p.members.map(A.name).join(', ')}. Assigned by ${A.name(p.by)}.` + (p.note ? ' Has a note.' : '');
     // delayed work stands out: orange stripe when it's due today, red when it's overdue (not once it's Done)
     const days = p.col === 'done' ? null : B.daysLeft(p.deadline);
     const delay = days == null ? '' : days < 0 ? ' overdue' : days === 0 ? ' due-today' : '';
@@ -154,7 +194,7 @@
         h('div', { class: 'bd-title' }, h('span', { class: 'bd-num' }, p.number), p.name ? h('span', { class: 'bd-name' }, p.name) : null),
         p.label && p.label !== 'none' ? h('span', { class: 'bd-label bd-lab-' + p.label }, B.labelName(p.label)) : null),
       fromLine,
-      p.prio !== 2 ? h('div', { class: 'bd-tags' }, prioTag(p.prio)) : null,
+      p.prio !== 2 || p.note ? h('div', { class: 'bd-tags' }, p.prio !== 2 ? prioTag(p.prio) : null, noteTag(p.note)) : null,
       p.members.length ? memberChips(p.members) : h('div', { class: 'bd-unassigned' }, icon('users'), pending ? 'Receive it to assign members' : B.canEdit(p.team) ? 'Not assigned yet · click to assign' : 'Not assigned yet'),
       progressBar(p.pct, p.col),
       h('div', { class: 'bd-foot' },
@@ -264,6 +304,11 @@
     const num = h('input', { class: 'input bd-num-input', id: 'bd-num', maxlength: '40', placeholder: 'e.g. 380-1234-00', value: p ? p.number : '', autofocus: true, required: true, 'aria-required': 'true' });
     num.addEventListener('input', () => num.classList.remove('bd-missing'));
     const pname = h('input', { class: 'input', id: 'bd-name', maxlength: '80', placeholder: 'e.g. Tokyo branch inventory', value: p ? p.name : '' });
+    const note = h('textarea', { class: 'input bd-note-input', id: 'bd-note', rows: '3', maxlength: String(B.MAX_NOTE), placeholder: 'Anything the members should know about this project' });
+    note.value = p ? p.note : '';
+    const noteCount = h('span', { class: 'bd-note-count', 'aria-live': 'polite' });
+    const syncNote = () => { const n = note.value.length; noteCount.textContent = n > B.MAX_NOTE - 200 ? ` ${n}/${B.MAX_NOTE}` : ''; };
+    note.addEventListener('input', syncNote); syncNote();
     const labelChoices = B.labelsFor(team);
     let prio = p ? p.prio : 2, label = p && labelChoices.some(l => l.id === p.label) ? p.label : '';
     const prioSeg = h('div', { class: 'bd-seg', role: 'radiogroup', 'aria-label': 'Priority' });
@@ -300,7 +345,7 @@
       // point at what's missing before the save is refused
       if (!num.value.trim()) { num.classList.add('bd-missing'); num.focus(); }
       if (!label) labelSeg.classList.add('bd-missing');
-      const f = { number: num.value, name: pname.value, prio, label, members: picker.value(), col: status, pct: Number(pct.value), deadline: due.value, by: by.value };
+      const f = { number: num.value, name: pname.value, note: note.value, prio, label, members: picker.value(), col: status, pct: Number(pct.value), deadline: due.value, by: by.value };
       if (p) await B.update(p.pid, f); else await B.create(Object.assign(f, { team }));
       m.close();
       UI.toast(p ? `${f.number.trim()} saved` : !f.members.length ? `${f.number.trim()} added to Review. Assign members before it moves on.` : `${f.number.trim()} added. ${f.members.length === 1 ? A.name(f.members[0]) + ' was' : f.members.length + ' members were'} notified.`, 'ok');
@@ -326,6 +371,7 @@
       h('div', { class: 'bd-two' },
         h('div', { class: 'field' }, h('label', { for: 'bd-due' }, 'Deadline'), due),
         h('div', { class: 'field' }, h('label', { for: 'bd-by' }, 'Assigned by (superior)'), by)),
+      h('div', { class: 'field' }, h('label', { for: 'bd-note' }, 'Note', h('span', { class: 'muted' }, noteCount)), note),
       p ? historyBlock(p.pid) : null],
     foot: [del, h('span', { style: { flex: 1 } }), h('button', { class: 'btn', onclick: () => m.close() }, 'Cancel'), approve, save] });
     num.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); pname.focus(); } });
@@ -347,7 +393,8 @@
         h('span', { class: 'label' }, 'Assigned by'), h('span', null, person(p.by)),
         h('span', { class: 'label' }, 'Members'), p.members.length ? h('div', { class: 'bd-people' }, p.members.map(person)) : h('span', { class: 'muted' }, 'Not assigned yet'),
         p.from ? [h('span', { class: 'label' }, 'Came from'), h('span', null, `${A.teamName(p.from.team)} · approved by `, person(p.createdBy))] : null,
-        p.approved ? [h('span', { class: 'label' }, 'Approved by'), h('span', { class: 'bd-approved-cell' }, person(p.approved.by), h('span', { class: 'muted' }, ' ' + U.formatDateTime(p.approved.ts)))] : null),
+        p.approved ? [h('span', { class: 'label' }, 'Approved by'), h('span', { class: 'bd-approved-cell' }, person(p.approved.by), h('span', { class: 'muted' }, ' ' + U.formatDateTime(p.approved.ts)))] : null,
+        p.note ? [h('span', { class: 'label' }, 'Note'), h('div', { class: 'bd-view-note' }, p.note)] : null),
       h('p', { class: 'muted', style: { fontSize: '13px' } }, p.approved ? `Approved projects are locked. It was sent to the ${A.teamName(B.handoffTo(p.team))} board and leaves this board once one of its admins receives it.`
         : B.isPending(p) ? `Sent from ${A.teamName(p.from.team)}. An admin of ${A.teamName(p.team)} receives it, then assigns the members.`
         : 'Only admins can change projects. Ask ' + A.name(p.by) + ' if something needs updating.'),

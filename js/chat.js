@@ -127,6 +127,8 @@
       B.events.on('change', () => { schedule('side'); if (isBoard()) { if (leaveHiddenBoard()) return; schedule('msgs', 'head'); } }),
       B.events.on('open', it => BV.notificationsDialog(it && it.type === 'completed' ? { tab: 'history', pid: it.pid } : {})),
       Y.events.on('incoming', onIncoming),
+      // read here or on another PC: its pop-up in the Windows notification list goes away
+      Y.events.on('read', ch => { if (!ch.unread) SC.app.closeNotification(ch.id); }),
       Y.events.on('prefs', () => schedule('side', 'head', 'composer', 'msgs')),
       K.events.on('change', () => schedule('side')),
       Y.events.on('inbox', () => schedule('side')),
@@ -1472,7 +1474,7 @@
     // Notification settings (1.15): direct messages, group chats (and private channels), public channels; mentions have their own switch
     const kind = ch.kind === 'dm' ? 'dms' : ch.kind === 'group' ? 'groupMsgs' : 'channels';
     for (const m of msgs) {
-      if (m.deleted || !m.verified) continue;
+      if (m.deleted || !m.verified || m.ts <= Y.lastRead(ch.id)) continue; // already read (e.g. on another PC)
       const mentioned = m.mentions.includes(meId()) || m.mentions.includes('channel');
       if (viewing) continue;
       if (mentioned ? !N.allow('mentions') : !N.allow(kind)) continue;
@@ -3258,6 +3260,11 @@
 
   /** Shown once after each update (newest first). Add an entry here whenever APP_VERSION goes up. */
   const NEWS = [
+    { version: '1.18.0', items: [
+      ['bell', 'Unread counts are right in private windows', 'What you’ve read is now saved in the shared folder too, so a private (incognito) window or another PC no longer shows old messages as unread.'],
+      ['bellOff', 'Read messages clear their pop-ups', 'Once you read a conversation, here or on another PC, its desktop notification goes away.'],
+      ['file', 'Notes on projects', 'Admins can add a note to a project. Cards with a note show a Note badge: hover it to read the note.'],
+    ] },
     { version: '1.17.0', items: [
       ['poll', 'Everyone can vote in announcement polls', 'Admins, the super admin and whoever posted the announcement can now vote too, like everyone else it was sent to.'],
     ] },
